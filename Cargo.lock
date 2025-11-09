@@ -6302,7 +6302,6 @@ dependencies = [
  "monad-secp",
  "monoio",
  "proptest",
- "rand 0.8.5",
  "rstest",
  "secp256k1",
  "serde",
