@@ -21,12 +21,15 @@ use std::{
 use tracing::debug;
 
 use super::{
-    common::{Config, MessageEvent, RekeyEvent, SessionError, SessionState, TerminatedEvent},
+    common::{MessageEvent, RekeyEvent, RenewedTimer, SessionError, SessionState, TerminatedEvent},
     replay_filter::ReplayFilter,
 };
-use crate::protocol::{
-    common::{CipherKey, SessionIndex},
-    messages::{DataPacket, DataPacketHeader, Plaintext},
+use crate::{
+    config::Config,
+    protocol::{
+        common::{CipherKey, SessionIndex},
+        messages::{DataPacket, DataPacketHeader, Plaintext},
+    },
 };
 
 pub struct TransportState {
@@ -61,7 +64,7 @@ impl TransportState {
         config: &Config,
         duration_since_start: Duration,
         plaintext: &mut [u8],
-    ) -> (DataPacketHeader, Duration) {
+    ) -> (DataPacketHeader, RenewedTimer) {
         use crate::protocol::crypto;
 
         let header = DataPacketHeader {
@@ -73,14 +76,21 @@ impl TransportState {
 
         self.send_nonce += 1;
 
-        self.common.reset_keepalive(
+        let keepalive_timer = self.common.reset_keepalive(
             duration_since_start,
             super::common::add_jitter(rng, config.keepalive_interval, config.keepalive_jitter),
         );
-        let timer = self
+
+        let next_deadline = self
             .common
             .get_next_deadline()
             .expect("expected at least one timer to be set");
+
+        let timer = RenewedTimer {
+            previous: keepalive_timer.previous,
+            current: next_deadline,
+        };
+
         (header, timer)
     }
 
@@ -89,7 +99,7 @@ impl TransportState {
         config: &Config,
         duration_since_start: Duration,
         mut data_packet: DataPacket<'a>,
-    ) -> Result<(Duration, Plaintext<'a>), SessionError> {
+    ) -> Result<(RenewedTimer, Plaintext<'a>), SessionError> {
         use crate::protocol::crypto;
 
         self.replay_filter.check(data_packet.header().nonce.get())?;
@@ -108,12 +118,20 @@ impl TransportState {
 
         self.replay_filter.update(counter);
 
-        self.common
+        let session_timer = self
+            .common
             .reset_session_timeout(duration_since_start, config.session_timeout);
-        let timer = self
+
+        let next_deadline = self
             .common
             .get_next_deadline()
             .expect("expected at least one timer to be set");
+
+        let timer = RenewedTimer {
+            previous: session_timer.previous,
+            current: next_deadline,
+        };
+
         Ok((timer, Plaintext::new(data_packet)))
     }
 

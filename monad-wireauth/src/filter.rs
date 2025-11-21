@@ -82,7 +82,7 @@ impl Filter {
             // tick on filter is expected to be called more often than the reset interval
             if let Some(elapsed) = duration_since_start.checked_sub(expected_reset_time) {
                 let elapsed_ms = elapsed.as_millis();
-                if elapsed_ms > 5 {
+                if elapsed_ms > 100 {
                     warn!(
                         elapsed_ms=elapsed_ms,
                         last_reset=?self.last_reset,
@@ -178,6 +178,8 @@ impl Filter {
             }
             None => {
                 self.ip_request_history.put(ip, duration_since_start);
+                self.metrics[GAUGE_WIREAUTH_FILTER_IP_REQUEST_HISTORY_SIZE] =
+                    self.ip_request_history.len() as u64;
                 None
             }
         }

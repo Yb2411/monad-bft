@@ -30,6 +30,16 @@ pub const GAUGE_WIREAUTH_STATE_SESSION_ESTABLISHED_INITIATOR: &str =
 pub const GAUGE_WIREAUTH_STATE_SESSION_ESTABLISHED_RESPONDER: &str =
     "monad.wireauth.state.session_established_responder";
 pub const GAUGE_WIREAUTH_STATE_SESSION_TERMINATED: &str = "monad.wireauth.state.session_terminated";
+pub const GAUGE_WIREAUTH_STATE_TIMERS_SIZE: &str = "monad.wireauth.state.timers_size";
+pub const GAUGE_WIREAUTH_STATE_PACKET_QUEUE_SIZE: &str = "monad.wireauth.state.packet_queue_size";
+pub const GAUGE_WIREAUTH_STATE_INITIATED_SESSION_BY_PEER_SIZE: &str =
+    "monad.wireauth.state.initiated_session_by_peer_size";
+pub const GAUGE_WIREAUTH_STATE_ACCEPTED_SESSIONS_BY_PEER_SIZE: &str =
+    "monad.wireauth.state.accepted_sessions_by_peer_size";
+pub const GAUGE_WIREAUTH_STATE_IP_SESSION_COUNTS_SIZE: &str =
+    "monad.wireauth.state.ip_session_counts_size";
+pub const GAUGE_WIREAUTH_FILTER_IP_REQUEST_HISTORY_SIZE: &str =
+    "monad.wireauth.filter.ip_request_history_size";
 
 pub const GAUGE_WIREAUTH_FILTER_PASS: &str = "monad.wireauth.filter.pass";
 pub const GAUGE_WIREAUTH_FILTER_SEND_COOKIE: &str = "monad.wireauth.filter.send_cookie";
@@ -42,6 +52,7 @@ pub const GAUGE_WIREAUTH_API_ENCRYPT_BY_PUBLIC_KEY: &str =
 pub const GAUGE_WIREAUTH_API_ENCRYPT_BY_SOCKET: &str = "monad.wireauth.api.encrypt_by_socket";
 pub const GAUGE_WIREAUTH_API_DISCONNECT: &str = "monad.wireauth.api.disconnect";
 pub const GAUGE_WIREAUTH_API_DISPATCH_CONTROL: &str = "monad.wireauth.api.dispatch_control";
+pub const GAUGE_WIREAUTH_API_NEXT_PACKET: &str = "monad.wireauth.api.next_packet";
 pub const GAUGE_WIREAUTH_API_TICK: &str = "monad.wireauth.api.tick";
 
 pub const GAUGE_WIREAUTH_DISPATCH_HANDSHAKE_INIT: &str =
@@ -65,10 +76,6 @@ pub const GAUGE_WIREAUTH_ERROR_TIMESTAMP_REPLAY: &str = "monad.wireauth.error.ti
 pub const GAUGE_WIREAUTH_ERROR_SESSION_NOT_FOUND: &str = "monad.wireauth.error.session_not_found";
 pub const GAUGE_WIREAUTH_ERROR_SESSION_INDEX_NOT_FOUND: &str =
     "monad.wireauth.error.session_index_not_found";
-pub const GAUGE_WIREAUTH_ERROR_INVALID_RECEIVER_INDEX: &str =
-    "monad.wireauth.error.invalid_receiver_index";
-pub const GAUGE_WIREAUTH_ERROR_SESSION_NOT_ESTABLISHED_FOR_ADDRESS: &str =
-    "monad.wireauth.error.session_not_established_for_address";
 pub const GAUGE_WIREAUTH_ERROR_HANDSHAKE_INIT_VALIDATION: &str =
     "monad.wireauth.error.handshake_init_validation";
 pub const GAUGE_WIREAUTH_ERROR_COOKIE_REPLY: &str = "monad.wireauth.error.cookie_reply";
@@ -81,6 +88,4 @@ pub const GAUGE_WIREAUTH_ENQUEUED_HANDSHAKE_RESPONSE: &str =
 pub const GAUGE_WIREAUTH_ENQUEUED_COOKIE_REPLY: &str = "monad.wireauth.enqueued.cookie_reply";
 pub const GAUGE_WIREAUTH_ENQUEUED_KEEPALIVE: &str = "monad.wireauth.enqueued.keepalive";
 
-pub const GAUGE_WIREAUTH_PACKET_QUEUE_SIZE: &str = "monad.wireauth.packet_queue.size";
-pub const GAUGE_WIREAUTH_TIMERS_SIZE: &str = "monad.wireauth.timers.size";
 pub const GAUGE_WIREAUTH_RATE_LIMIT_DROP: &str = "monad.wireauth.rate_limit.drop";
