@@ -21,10 +21,11 @@ use itertools::Itertools;
 use lru::LruCache;
 use monad_crypto::hasher::{Hasher, HasherType};
 use monad_dataplane::udp::DEFAULT_SEGMENT_SIZE;
+use monad_executor::ExecutorMetrics;
 use monad_raptor::ManagedDecoder;
 use monad_raptorcast::{
     packet::build_messages,
-    udp::{parse_message, GroupId, MAX_REDUNDANCY, SIGNATURE_CACHE_SIZE},
+    udp::{parse_message, GroupId, NoopRateLimiter, MAX_REDUNDANCY, SIGNATURE_CACHE_SIZE},
     util::{BuildTarget, EpochValidators, Redundancy},
 };
 use monad_secp::{KeyPair, SecpSignature};
@@ -121,10 +122,13 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         .map(|(_to, message)| message)
         .collect_vec();
 
-        let example_chunk = parse_message::<SecpSignature>(
+        let example_chunk = parse_message::<SecpSignature, _>(
             &mut LruCache::new(SIGNATURE_CACHE_SIZE),
+            &NoopRateLimiter,
+            &mut ExecutorMetrics::default(),
             messages[0].clone().split_to(DEFAULT_SEGMENT_SIZE.into()),
             u64::MAX,
+            false,
         )
         .expect("valid chunk");
 
@@ -143,12 +147,16 @@ pub fn criterion_benchmark(c: &mut Criterion) {
                         .unwrap()
                 };
                 let mut decode_success = false;
+                let mut metrics = ExecutorMetrics::default();
                 for mut message in messages {
                     while !message.is_empty() {
-                        let parsed_message = parse_message::<SecpSignature>(
+                        let parsed_message = parse_message::<SecpSignature, _>(
                             &mut signature_cache,
+                            &NoopRateLimiter,
+                            &mut metrics,
                             message.split_to(DEFAULT_SEGMENT_SIZE.into()),
                             u64::MAX,
+                            false,
                         )
                         .expect("valid message");
                         decoder.received_encoded_symbol(

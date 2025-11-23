@@ -25,6 +25,26 @@ pub const GAUGE_RAPTORCAST_TOTAL_RECV_ERRORS: &str = "monad.raptorcast.total_rec
 
 const HISTOGRAM_CLEAR_INTERVAL: Duration = Duration::from_secs(30);
 
+pub const GAUGE_RAPTORCAST_DECODING_CACHE_SIGNATURE_VERIFICATIONS_ATTEMPTED: &str =
+    "monad.raptorcast.decoding_cache.signature_verifications_attempted";
+pub const GAUGE_RAPTORCAST_DECODING_CACHE_SIGNATURE_VERIFICATIONS_RATE_LIMITED: &str =
+    "monad.raptorcast.decoding_cache.signature_verifications_rate_limited";
+pub const GAUGE_RAPTORCAST_DECODING_CACHE_NEW_MESSAGES_INSERTED: &str =
+    "monad.raptorcast.decoding_cache.new_messages_inserted";
+
+pub const GAUGE_RAPTORCAST_DECODING_CACHE_EVICTIONS_AUTHOR_QUOTA: &str =
+    "monad.raptorcast.decoding_cache.evictions_author_quota";
+pub const GAUGE_RAPTORCAST_DECODING_CACHE_EVICTIONS_ALL_AUTHORS_QUOTA: &str =
+    "monad.raptorcast.decoding_cache.evictions_all_authors_quota";
+pub const GAUGE_RAPTORCAST_DECODING_CACHE_EVICTIONS_EXPIRED: &str =
+    "monad.raptorcast.decoding_cache.evictions_expired";
+pub const GAUGE_RAPTORCAST_DECODING_CACHE_EVICTIONS_RANDOM: &str =
+    "monad.raptorcast.decoding_cache.evictions_random";
+
+pub const PRIMARY_BROADCAST_LATENCY_P50_MS: &str =
+    "monad.bft.raptorcast.udp.primary_broadcast_latency_p50_ms";
+pub const PRIMARY_BROADCAST_LATENCY_P90_MS: &str =
+    "monad.bft.raptorcast.udp.primary_broadcast_latency_p90_ms";
 pub const PRIMARY_BROADCAST_LATENCY_P99_MS: &str =
     "monad.bft.raptorcast.udp.primary_broadcast_latency_p99_ms";
 pub const PRIMARY_BROADCAST_LATENCY_COUNT: &str =
@@ -112,6 +132,10 @@ impl UdpStateMetrics {
 
     pub fn executor_metrics(&self) -> &ExecutorMetrics {
         &self.executor_metrics
+    }
+
+    pub fn executor_metrics_mut(&mut self) -> &mut ExecutorMetrics {
+        &mut self.executor_metrics
     }
 }
 

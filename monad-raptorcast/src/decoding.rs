@@ -31,11 +31,18 @@ use monad_crypto::{
     certificate_signature::PubKey,
     hasher::{Hasher as _, HasherType},
 };
+use monad_executor::ExecutorMetrics;
 use monad_raptor::{ManagedDecoder, SOURCE_SYMBOLS_MIN};
 use monad_types::{NodeId, Stake};
 use rand::Rng as _;
 
 use crate::{
+    metrics::{
+        GAUGE_RAPTORCAST_DECODING_CACHE_EVICTIONS_ALL_AUTHORS_QUOTA,
+        GAUGE_RAPTORCAST_DECODING_CACHE_EVICTIONS_AUTHOR_QUOTA,
+        GAUGE_RAPTORCAST_DECODING_CACHE_EVICTIONS_EXPIRED,
+        GAUGE_RAPTORCAST_DECODING_CACHE_EVICTIONS_RANDOM,
+    },
     udp::{ValidatedMessage, MAX_REDUNDANCY},
     util::{compute_hash, AppMessageHash, BroadcastMode, HexBytes, NodeIdHash},
 };
@@ -153,6 +160,7 @@ where
         &mut self,
         message: &ValidatedMessage<PT>,
         context: &DecodingContext<'_, PT>,
+        metrics: &mut ExecutorMetrics,
     ) -> Result<TryDecodeStatus<PT>, TryDecodeError> {
         let cache_key = CacheKey::from_message(message);
         let decoder_state = match self.decoder_state_entry(&cache_key, message, context) {
@@ -178,7 +186,7 @@ where
                     .map_err(TryDecodeError::InvalidSymbol)?;
 
                 let Some(decoder_state) =
-                    self.insert_decoder_state(&cache_key, message, decoder_state, context)
+                    self.insert_decoder_state(&cache_key, message, decoder_state, context, metrics)
                 else {
                     // the cache rejected the new entry
                     return Ok(TryDecodeStatus::RejectedByCache);
@@ -253,9 +261,10 @@ where
         message: &ValidatedMessage<PT>,
         decoder_state: DecoderState,
         context: &DecodingContext<'_, PT>,
+        metrics: &mut ExecutorMetrics,
     ) -> Option<&mut DecoderState> {
         let cache = self.pending_messages.get_cache_tier(message, context);
-        cache.insert(cache_key, message, decoder_state, context);
+        cache.insert(cache_key, message, decoder_state, context, metrics);
         cache.get_mut(cache_key)
     }
 
@@ -489,6 +498,7 @@ impl<PT: PubKey> SoftQuotaCache<PT> {
         message: &ValidatedMessage<PT>,
         decoder_state: DecoderState,
         context: &DecodingContext<PT>,
+        metrics: &mut ExecutorMetrics,
     ) {
         let quota = self
             .quota_policy
@@ -515,6 +525,8 @@ impl<PT: PubKey> SoftQuotaCache<PT> {
             if !evicted_keys.is_empty() {
                 self.cache_store.remove_many(&evicted_keys);
                 debug_assert!(!self.is_full());
+                metrics[GAUGE_RAPTORCAST_DECODING_CACHE_EVICTIONS_AUTHOR_QUOTA] +=
+                    evicted_keys.len() as u64;
                 tracing::debug!(
                     ?message,
                     ?context,
@@ -531,6 +543,8 @@ impl<PT: PubKey> SoftQuotaCache<PT> {
         if !evicted_keys.is_empty() {
             // some keys are evicted, so the cache should no longer be full.
             debug_assert!(!self.is_full());
+            metrics[GAUGE_RAPTORCAST_DECODING_CACHE_EVICTIONS_ALL_AUTHORS_QUOTA] +=
+                evicted_keys.len() as u64;
             tracing::debug!(
                 ?message,
                 ?context,
@@ -547,6 +561,7 @@ impl<PT: PubKey> SoftQuotaCache<PT> {
         if !expired_keys.is_empty() {
             // some keys are evicted, so the cache should no longer be full.
             debug_assert!(!self.is_full());
+            metrics[GAUGE_RAPTORCAST_DECODING_CACHE_EVICTIONS_EXPIRED] += expired_keys.len() as u64;
             tracing::debug!(
                 ?message,
                 ?context,
@@ -563,8 +578,9 @@ impl<PT: PubKey> SoftQuotaCache<PT> {
         let (key, author, _decoder_state) = self.cache_store.get_random().expect("cache not empty");
         self.author_index.remove(author, &key);
         self.cache_store.remove(&key);
+        metrics[GAUGE_RAPTORCAST_DECODING_CACHE_EVICTIONS_RANDOM] += 1;
 
-        tracing::warn!(
+        tracing::debug!(
             ?message,
             ?context,
             ?quota,
@@ -1547,6 +1563,24 @@ mod test {
     use crate::{udp::GroupId, util::BroadcastMode};
     type PT = monad_crypto::NopPubKey;
 
+    trait DecoderCacheTestExt {
+        fn try_decode_test(
+            &mut self,
+            message: &ValidatedMessage<PT>,
+            context: &DecodingContext<'_, PT>,
+        ) -> Result<TryDecodeStatus<PT>, TryDecodeError>;
+    }
+
+    impl DecoderCacheTestExt for DecoderCache<PT> {
+        fn try_decode_test(
+            &mut self,
+            message: &ValidatedMessage<PT>,
+            context: &DecodingContext<'_, PT>,
+        ) -> Result<TryDecodeStatus<PT>, TryDecodeError> {
+            self.try_decode(message, context, &mut ExecutorMetrics::default())
+        }
+    }
+
     const EPOCH: Epoch = Epoch(1);
     const UNIX_TS_MS: u64 = 1_000_000;
 
@@ -1727,7 +1761,7 @@ mod test {
         assert_eq!(cache.recently_decoded_len(), 1);
 
         // Send one more symbol for the same message.
-        let res = cache.try_decode(&symbols[0], &context).unwrap();
+        let res = cache.try_decode_test(&symbols[0], &context).unwrap();
         assert!(cache.consistency_breaches().is_empty());
         assert!(matches!(res, TryDecodeStatus::RecentlyDecoded));
     }
@@ -1742,7 +1776,7 @@ mod test {
         let context = DecodingContext::new(None, old_ts);
 
         // Insert an old message.
-        let _ = cache.try_decode(&symbols[0], &context);
+        let _ = cache.try_decode_test(&symbols[0], &context);
         assert_eq!(cache.pending_len(MessageTier::P2P), 1);
 
         // Fill the cache to trigger pruning.
@@ -1751,7 +1785,7 @@ mod test {
             let new_author = node_id(i);
             let new_symbols = make_symbols(&new_app_message, new_author, UNIX_TS_MS);
             let new_context = DecodingContext::new(None, UNIX_TS_MS);
-            let _ = cache.try_decode(&new_symbols[0], &new_context);
+            let _ = cache.try_decode_test(&new_symbols[0], &new_context);
             assert!(cache.consistency_breaches().is_empty());
         }
 
@@ -2018,25 +2052,25 @@ mod test {
         let context = DecodingContext::new(None, UNIX_TS_MS);
 
         // Insert a valid symbol first.
-        let _ = cache.try_decode(&symbols[0], &context);
+        let _ = cache.try_decode_test(&symbols[0], &context);
         assert!(cache.consistency_breaches().is_empty());
 
         // Invalid symbol length.
         let mut invalid_symbol = symbols[1].clone();
         invalid_symbol.chunk_id = u16::MAX;
-        let res = cache.try_decode(&invalid_symbol, &context);
+        let res = cache.try_decode_test(&invalid_symbol, &context);
         assert!(cache.consistency_breaches().is_empty());
         assert!(matches!(res, Err(TryDecodeError::InvalidSymbol(_))));
 
         // Invalid symbol id.
         let mut invalid_symbol = symbols[1].clone();
         invalid_symbol.chunk_id = 9999;
-        let res = cache.try_decode(&invalid_symbol, &context);
+        let res = cache.try_decode_test(&invalid_symbol, &context);
         assert!(cache.consistency_breaches().is_empty());
         assert!(matches!(res, Err(TryDecodeError::InvalidSymbol(_))));
 
         // Symbol already seen.
-        let res = cache.try_decode(&symbols[0], &context);
+        let res = cache.try_decode_test(&symbols[0], &context);
         assert!(cache.consistency_breaches().is_empty());
         assert!(matches!(res, Err(TryDecodeError::InvalidSymbol(_))));
     }
@@ -2054,12 +2088,12 @@ mod test {
         // Fill the cache.
         let app_message0 = Bytes::from(vec![0u8; APP_MESSAGE_LEN]);
         let symbols0 = make_symbols(&app_message0, author, UNIX_TS_MS + 2);
-        let _ = cache.try_decode(&symbols0[0], &context);
+        let _ = cache.try_decode_test(&symbols0[0], &context);
         assert!(cache.consistency_breaches().is_empty());
 
         let app_message1 = Bytes::from(vec![1u8; APP_MESSAGE_LEN]);
         let symbols1 = make_symbols(&app_message1, author, UNIX_TS_MS + 1);
-        let _ = cache.try_decode(&symbols1[0], &context);
+        let _ = cache.try_decode_test(&symbols1[0], &context);
         assert!(cache.consistency_breaches().is_empty());
 
         assert_eq!(cache.pending_len(MessageTier::P2P), 2);
@@ -2067,7 +2101,7 @@ mod test {
         // Try to insert an older message.
         let app_message2 = Bytes::from(vec![2u8; APP_MESSAGE_LEN]);
         let symbols2 = make_symbols(&app_message2, author, UNIX_TS_MS);
-        let res = cache.try_decode(&symbols2[0], &context);
+        let res = cache.try_decode_test(&symbols2[0], &context);
         assert!(cache.consistency_breaches().is_empty());
         assert_eq!(cache.pending_len(MessageTier::P2P), 2);
 
@@ -2098,7 +2132,7 @@ mod test {
 
         // feed the cache four messages.
         for i in 1..=4 {
-            let res = cache.try_decode(&partial_symbol(i, UNIX_TS_MS), &context);
+            let res = cache.try_decode_test(&partial_symbol(i, UNIX_TS_MS), &context);
             assert!(cache.consistency_breaches().is_empty());
             assert!(matches!(res, Ok(TryDecodeStatus::NeedsMoreSymbols)));
             assert!(cache.pending_len(MessageTier::P2P) == i as usize);
@@ -2108,7 +2142,7 @@ mod test {
         // try to insert a 5th message. the cache rejects the message
         // despite the existence of empty slots, because the cache's
         // total_size limit is exceeded.
-        let res = cache.try_decode(&partial_symbol(5, UNIX_TS_MS - 1), &context);
+        let res = cache.try_decode_test(&partial_symbol(5, UNIX_TS_MS - 1), &context);
         assert!(cache.consistency_breaches().is_empty());
         assert!(matches!(res, Ok(TryDecodeStatus::RejectedByCache)));
         // the offending author's max_size quota is enforced
@@ -2121,12 +2155,13 @@ mod test {
         symbols: impl Iterator<Item = &'a ValidatedMessage<PT>>,
     ) -> Result<Vec<(NodeId<PT>, Bytes)>, TryDecodeError> {
         let mut decoded = Vec::new();
+        let mut metrics = ExecutorMetrics::default();
         for symbol in symbols {
             assert!(cache.consistency_breaches().is_empty());
             if let TryDecodeStatus::Decoded {
                 author,
                 app_message,
-            } = cache.try_decode(symbol, context)?
+            } = cache.try_decode(symbol, context, &mut metrics)?
             {
                 decoded.push((author, app_message));
             }
