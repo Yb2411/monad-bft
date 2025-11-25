@@ -617,6 +617,7 @@ where
     let up_bandwidth_mbps = 1_000;
     let non_authenticated_addr = SocketAddr::new(local_addr.ip(), local_addr.port() + 1);
     let dp = DataplaneBuilder::new(&local_addr, up_bandwidth_mbps)
+        .with_udp_multishot(true)
         .extend_udp_sockets(vec![
             monad_dataplane::UdpSocketConfig {
                 socket_addr: local_addr,
