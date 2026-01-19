@@ -91,7 +91,7 @@ impl<C: Context, K: AsRef<monad_secp::KeyPair>> API<C, K> {
         }
     }
 
-    pub fn metrics(&self) -> ExecutorMetricsChain {
+    pub fn metrics(&self) -> ExecutorMetricsChain<'_> {
         ExecutorMetricsChain::default()
             .push(&self.metrics)
             .push(self.state.metrics())
@@ -395,7 +395,7 @@ impl<C: Context, K: AsRef<monad_secp::KeyPair>> API<C, K> {
         if self
             .state
             .get_max_timestamp(&remote_key)
-            .is_some_and(|max| validated_init.system_time <= max)
+            .is_some_and(|max| validated_init.timestamp <= max)
         {
             self.metrics[GAUGE_WIREAUTH_ERROR_TIMESTAMP_REPLAY] += 1;
             debug!(?remote_addr, ?remote_key, "timestamp replay detected");

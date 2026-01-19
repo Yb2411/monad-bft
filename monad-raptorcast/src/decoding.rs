@@ -31,14 +31,22 @@ use monad_crypto::{
     certificate_signature::PubKey,
     hasher::{Hasher as _, HasherType},
 };
+use monad_executor::{ExecutorMetrics, ExecutorMetricsChain};
 use monad_raptor::{ManagedDecoder, SOURCE_SYMBOLS_MIN};
 use monad_types::{NodeId, Stake};
+use monad_validator::validator_set::{ValidatorSet, ValidatorSetType as _};
 use rand::Rng as _;
 
 use crate::{
     udp::{ValidatedMessage, MAX_REDUNDANCY},
     util::{compute_hash, AppMessageHash, BroadcastMode, HexBytes, NodeIdHash},
 };
+
+pub const DECODING_CACHE_METRIC_PREFIX: &str = "monad.raptorcast.decoding_cache";
+pub const METRIC_RECENTLY_DECODED_HIT: &str = "monad.raptorcast.decoding_cache.decoded_hit";
+pub const METRIC_PENDING_HIT: &str = "monad.raptorcast.decoding_cache.pending_hit";
+pub const METRIC_NEW_ENTRY: &str = "monad.raptorcast.decoding_cache.new_entry";
+pub const METRIC_DECODED: &str = "monad.raptorcast.decoding_cache.decoded";
 
 pub(crate) const RECENTLY_DECODED_CACHE_SIZE: usize = 10000;
 
@@ -124,6 +132,7 @@ where
 {
     pending_messages: TieredCache<PT>,
     recently_decoded: LruCache<CacheKey, RecentlyDecodedState>,
+    metrics: ExecutorMetrics,
 }
 
 impl<PT> Default for DecoderCache<PT>
@@ -146,6 +155,7 @@ where
         Self {
             recently_decoded: LruCache::new(recently_decoded_cache_size),
             pending_messages: TieredCache::new(config),
+            metrics: ExecutorMetrics::default(),
         }
     }
 
@@ -155,12 +165,17 @@ where
         context: &DecodingContext<'_, PT>,
     ) -> Result<TryDecodeStatus<PT>, TryDecodeError> {
         let cache_key = CacheKey::from_message(message);
+        // the usage pattern of this variable is to appease the Rust
+        // borrow checker that rejects simple in-place mutation of
+        // self.metrics.
+        let cache_hit_metric;
         let decoder_state = match self.decoder_state_entry(&cache_key, message, context) {
             Some(MessageCacheEntry::RecentlyDecoded(recently_decoded)) => {
                 // the app message was recently decoded
                 recently_decoded
                     .handle_message(message)
                     .map_err(TryDecodeError::InvalidSymbol)?;
+                self.metrics[METRIC_RECENTLY_DECODED_HIT] += 1;
                 return Ok(TryDecodeStatus::RecentlyDecoded);
             }
 
@@ -169,6 +184,7 @@ where
                 decoder_state
                     .handle_message(message)
                     .map_err(TryDecodeError::InvalidSymbol)?;
+                cache_hit_metric = METRIC_PENDING_HIT;
                 decoder_state
             }
 
@@ -181,19 +197,25 @@ where
                     self.insert_decoder_state(&cache_key, message, decoder_state, context)
                 else {
                     // the cache rejected the new entry
+                    self.metrics[METRIC_NEW_ENTRY] += 1;
                     return Ok(TryDecodeStatus::RejectedByCache);
                 };
+                cache_hit_metric = METRIC_NEW_ENTRY;
                 decoder_state
             }
         };
 
         if !decoder_state.decoder.try_decode() {
+            self.metrics[cache_hit_metric] += 1;
             return Ok(TryDecodeStatus::NeedsMoreSymbols);
         }
 
         let Some(mut decoded) = decoder_state.decoder.reconstruct_source_data() else {
+            self.metrics[cache_hit_metric] += 1;
             return Err(TryDecodeError::UnableToReconstructSourceData);
         };
+
+        self.metrics[cache_hit_metric] += 1;
 
         // decoding succeeds at this point.
         let app_message_len = message
@@ -221,6 +243,7 @@ where
 
         self.recently_decoded
             .put(cache_key, RecentlyDecodedState::from(decoder_state));
+        self.metrics[METRIC_DECODED] += 1;
 
         Ok(TryDecodeStatus::Decoded {
             author: message.author,
@@ -307,9 +330,15 @@ where
     fn consistency_breaches(&self) -> Vec<String> {
         self.pending_messages.consistency_breaches()
     }
-}
 
-type ValidatorSet<PT> = BTreeMap<NodeId<PT>, Stake>;
+    pub fn metrics(&self) -> ExecutorMetricsChain<'_> {
+        ExecutorMetricsChain::default()
+            .push(&self.metrics)
+            .push(self.pending_messages.validator.metrics())
+            .push(self.pending_messages.broadcast.metrics())
+            .push(self.pending_messages.p2p.metrics())
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MessageTier {
@@ -328,7 +357,7 @@ impl MessageTier {
         }
 
         if let Some(validator_set) = context.validator_set {
-            if validator_set.contains_key(&message.author) {
+            if validator_set.is_member(&message.author) {
                 return MessageTier::Validator;
             }
         }
@@ -358,9 +387,9 @@ where
             pruning_cooldown: Duration::from_secs(10), // 10 seconds cooldown
         };
 
-        let broadcast_cache = SoftQuotaCache::new(config.broadcast_tier, prune_config);
-        let validator_cache = SoftQuotaCache::new(config.validator_tier, prune_config);
-        let p2p_cache = SoftQuotaCache::new(config.p2p_tier, prune_config);
+        let broadcast_cache = SoftQuotaCache::new("broadcast", config.broadcast_tier, prune_config);
+        let validator_cache = SoftQuotaCache::new("validator", config.validator_tier, prune_config);
+        let p2p_cache = SoftQuotaCache::new("p2p", config.p2p_tier, prune_config);
 
         Self {
             broadcast: broadcast_cache,
@@ -463,7 +492,47 @@ impl<'a, PT: PubKey> DecodingContext<'a, PT> {
     }
 
     pub fn validator_set_size(&self) -> Option<usize> {
-        self.validator_set.map(|set| set.len())
+        self.validator_set.map(|set| set.get_members().len())
+    }
+}
+
+struct SoftQuotaCacheMetrics {
+    pub total_insertions: &'static str,
+    pub total_evictions_from_overquota_author: &'static str,
+    pub total_evictions_from_overquota_others: &'static str,
+    pub total_evictions_from_expiry: &'static str,
+    pub total_random_evictions: &'static str,
+    metrics: ExecutorMetrics,
+}
+
+impl SoftQuotaCacheMetrics {
+    pub fn new(prefix: &str, tier: &str) -> Self {
+        let full_name = |name: &str| -> &'static str {
+            // leaking the names is safe because the cache is expected
+            // to be constructed only once.
+            format!("{prefix}.{tier}.{name}").leak()
+        };
+
+        Self {
+            total_insertions: full_name("total_insertions"),
+            total_evictions_from_overquota_author: full_name(
+                "total_evictions_from_overquota_author",
+            ),
+            total_evictions_from_overquota_others: full_name(
+                "total_evictions_from_overquota_others",
+            ),
+            total_evictions_from_expiry: full_name("total_evictions_from_expiry"),
+            total_random_evictions: full_name("total_random_evictions"),
+            metrics: ExecutorMetrics::default(),
+        }
+    }
+
+    pub fn incr(&mut self, key: &'static str, value: usize) {
+        self.metrics[key] += value as u64;
+    }
+
+    pub fn metrics(&self) -> &ExecutorMetrics {
+        &self.metrics
     }
 }
 
@@ -479,11 +548,13 @@ struct SoftQuotaCache<PT: PubKey> {
     author_index: AuthorIndex<PT>,
 
     quota_policy: Box<dyn QuotaPolicy<PT> + Send + Sync>,
+    metrics: SoftQuotaCacheMetrics,
 }
 
 impl<PT: PubKey> SoftQuotaCache<PT> {
-    pub fn new(config: SoftQuotaCacheConfig, prune_config: PruneConfig) -> Self {
+    pub fn new(tier: &str, config: SoftQuotaCacheConfig, prune_config: PruneConfig) -> Self {
         let quota_policy = quota_policy_from_config(&config);
+        let metrics = SoftQuotaCacheMetrics::new(DECODING_CACHE_METRIC_PREFIX, tier);
 
         let approx_num_authors = (config.total_slots / config.min_slots_per_author).max(1);
         let max_total_size = config.max_total_size_per_author * approx_num_authors;
@@ -505,6 +576,7 @@ impl<PT: PubKey> SoftQuotaCache<PT> {
             cache_store: CacheStore::new(config.total_slots),
             author_index: AuthorIndex::new(prune_config),
             quota_policy,
+            metrics,
         }
     }
 
@@ -521,6 +593,7 @@ impl<PT: PubKey> SoftQuotaCache<PT> {
 
         // insert the new cache entry without checking quota.
         self.insert_unchecked(cache_key, message, decoder_state, quota);
+        self.metrics.incr(self.metrics.total_insertions, 1);
 
         if !self.is_full() {
             // cache not full, nothing to evict.
@@ -541,6 +614,10 @@ impl<PT: PubKey> SoftQuotaCache<PT> {
             // for safety.
             if !evicted_keys.is_empty() {
                 self.cache_store.remove_many(&evicted_keys);
+                self.metrics.incr(
+                    self.metrics.total_evictions_from_overquota_author,
+                    evicted_keys.len(),
+                );
                 tracing::debug!(
                     ?message,
                     ?context,
@@ -558,6 +635,10 @@ impl<PT: PubKey> SoftQuotaCache<PT> {
         let evicted_keys = self.author_index.enforce_quota_all(context);
         self.cache_store.remove_many(&evicted_keys);
         if !evicted_keys.is_empty() {
+            self.metrics.incr(
+                self.metrics.total_evictions_from_overquota_others,
+                evicted_keys.len(),
+            );
             tracing::debug!(
                 ?message,
                 ?context,
@@ -574,6 +655,8 @@ impl<PT: PubKey> SoftQuotaCache<PT> {
         let expired_keys = self.author_index.prune_expired_all(context);
         self.cache_store.remove_many(&expired_keys);
         if !expired_keys.is_empty() {
+            self.metrics
+                .incr(self.metrics.total_evictions_from_expiry, expired_keys.len());
             tracing::debug!(
                 ?message,
                 ?context,
@@ -609,6 +692,7 @@ impl<PT: PubKey> SoftQuotaCache<PT> {
 
             self.author_index.remove(author, &key);
             self.cache_store.remove(&key);
+            self.metrics.incr(self.metrics.total_random_evictions, 1);
             tracing::debug!(
                 ?message,
                 ?context,
@@ -669,6 +753,10 @@ impl<PT: PubKey> SoftQuotaCache<PT> {
     #[cfg(test)]
     fn len(&self) -> usize {
         self.cache_store.len()
+    }
+
+    fn metrics(&self) -> &ExecutorMetrics {
+        self.metrics.metrics()
     }
 
     #[cfg(test)]
@@ -1249,7 +1337,7 @@ impl<PT: PubKey> QuotaPolicy<PT> for QuotaByStake {
         };
 
         // author is not validator, defaults to non-validator slot.
-        let Some(stake) = validator_set.get(&message.author) else {
+        let Some(stake) = validator_set.get_members().get(&message.author) else {
             return Quota {
                 max_slots: self.non_validator_slots.min(total_slots),
                 max_size: self.non_validator_max_size,
@@ -1257,7 +1345,7 @@ impl<PT: PubKey> QuotaPolicy<PT> for QuotaByStake {
         };
 
         // quota = proportional to stake
-        let total_stake: Stake = validator_set.values().copied().sum();
+        let total_stake: Stake = validator_set.get_total_stake();
         let stake_fraction = stake.checked_div(total_stake).unwrap_or(0.0);
         let calculated_slots = (stake_fraction * (total_slots as f64)).ceil() as usize;
 
@@ -1621,15 +1709,15 @@ mod test {
         NodeId::new(PT::from_bytes(&[seed as u8; 32]).unwrap())
     }
 
-    fn empty_validator_set() -> ValidatorSet<PT> {
-        BTreeMap::new()
-    }
-    fn add_validators(set: &mut ValidatorSet<PT>, ids: &[u64], stake: u64) {
-        let stake = Stake::from(stake);
-        for id in ids {
+    fn make_validator_set(node_stakes: &[(u64, u64)]) -> ValidatorSet<PT> {
+        let mut set = BTreeMap::new();
+        for (id, stake) in node_stakes {
             let node_id = node_id(*id);
+            let stake = Stake::from(*stake);
             set.insert(node_id, stake);
         }
+
+        ValidatorSet::new_unchecked(set)
     }
 
     fn make_cache(
@@ -1750,8 +1838,7 @@ mod test {
             UNIX_TS_MS,
         );
 
-        let mut validator_set = empty_validator_set();
-        add_validators(&mut validator_set, &[1], 100);
+        let validator_set = make_validator_set(&[(1, 100)]);
 
         let mut all_symbols: Vec<_> = []
             .into_iter()
@@ -1826,12 +1913,9 @@ mod test {
 
     #[test]
     fn test_stake_based_quota_allocation() {
-        let mut validator_set = empty_validator_set();
-
         // Author 0 has 80% of the stake, so should get 80% of the cache slots.
         // Author 1 has 20% of the stake, so should get 20% of the cache slots.
-        add_validators(&mut validator_set, &[0], 80);
-        add_validators(&mut validator_set, &[1], 20);
+        let validator_set = make_validator_set(&[(0, 80), (1, 20)]);
 
         // Part 1 is designed to be contain insufficient symbols
         let mut all_symbols_part_1 = vec![];
@@ -1899,10 +1983,7 @@ mod test {
         config.broadcast_tier.min_slots_per_validator = Some(2);
         config.broadcast_tier.min_slots_per_author = 1;
 
-        let mut validator_set = empty_validator_set();
-        add_validators(&mut validator_set, &[0], 50);
-        add_validators(&mut validator_set, &[1], 49);
-        add_validators(&mut validator_set, &[2], 1);
+        let validator_set = make_validator_set(&[(0, 50), (1, 49), (2, 1)]);
         // Author 3 is not a validator.
 
         // Part 1 is designed to be contain insufficient symbols

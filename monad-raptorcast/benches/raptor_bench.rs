@@ -29,6 +29,7 @@ use monad_raptorcast::{
 };
 use monad_secp::{KeyPair, SecpSignature};
 use monad_types::{Epoch, NodeId, Stake};
+use monad_validator::validator_set::ValidatorSet;
 
 #[allow(clippy::useless_vec)]
 pub fn criterion_benchmark(c: &mut Criterion) {
@@ -47,11 +48,12 @@ pub fn criterion_benchmark(c: &mut Criterion) {
             })
             .collect_vec();
 
+        let valset = keys
+            .iter()
+            .map(|key| (NodeId::new(key.pubkey()), Stake::ONE))
+            .collect();
         let validators = EpochValidators {
-            validators: keys
-                .iter()
-                .map(|key| (NodeId::new(key.pubkey()), Stake::ONE))
-                .collect(),
+            validators: ValidatorSet::new_unchecked(valset),
         };
 
         let known_addresses = keys
@@ -89,12 +91,14 @@ pub fn criterion_benchmark(c: &mut Criterion) {
             })
             .collect_vec();
 
+        let valset = keys
+            .iter()
+            .map(|key| (NodeId::new(key.pubkey()), Stake::ONE))
+            .collect();
         let validators = EpochValidators {
-            validators: keys
-                .iter()
-                .map(|key| (NodeId::new(key.pubkey()), Stake::ONE))
-                .collect(),
+            validators: ValidatorSet::new_unchecked(valset),
         };
+
         let epoch_validators = validators.view_without(vec![&NodeId::new(keys[0].pubkey())]);
 
         let known_addresses = keys

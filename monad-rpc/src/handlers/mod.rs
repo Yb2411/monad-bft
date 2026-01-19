@@ -94,7 +94,7 @@ pub async fn rpc_handler(
 
     let response = match request {
         RequestWrapper::Single(json_request) => {
-            let Ok(request) = serde_json::from_str::<Request>(json_request.get()) else {
+            let Ok(request) = Request::from_raw_value(json_request) else {
                 return HttpResponse::Ok().json(Response::from_error(JsonRpcError::parse_error()));
             };
             root_span.record("json_method", &request.method);
@@ -141,8 +141,7 @@ pub async fn rpc_handler(
                     let app_state = app_state.clone(); // cheap copy
 
                     async move {
-                        let Ok(request) = serde_json::from_str::<Request>(json_request.get())
-                        else {
+                        let Ok(request) = Request::from_raw_value(json_request) else {
                             return (
                                 crate::jsonrpc::RequestId::Null,
                                 Err(JsonRpcError::invalid_request()),
@@ -173,9 +172,7 @@ pub async fn rpc_handler(
 
     if response_raw_value.get().as_bytes().len() > app_state.max_response_size as usize {
         info!("response exceed size limit: {body:?}");
-        return HttpResponse::Ok().json(Response::from_error(JsonRpcError::custom(
-            "response exceed size limit".to_string(),
-        )));
+        return HttpResponse::Ok().json(Response::from_error(JsonRpcError::max_size_exceeded()));
     }
 
     // log the request and response based on the response content
@@ -517,6 +514,7 @@ async fn eth_getLogs(
         let params = serde_json::from_str(params.get()).invalid_params()?;
         monad_eth_getLogs(
             chain_state,
+            app_state.max_response_size,
             app_state.logs_max_block_range,
             params,
             app_state.use_eth_get_logs_index,

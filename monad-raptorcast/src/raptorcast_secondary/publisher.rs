@@ -67,7 +67,7 @@ where
     // We can't keep it inside the map because we want to return a reference to
     // the full-nodes in it (FullNodesView).
     // Actually we only need full_nodes_accepted & end_round from curr_group.
-    curr_group: Group<ST>,
+    curr_group: Group<CertificateSignaturePubKey<ST>>,
 
     // Metrics
     metrics: ExecutorMetrics,
@@ -79,7 +79,7 @@ where
 {
     pub fn new(
         validator_node_id: NodeId<CertificateSignaturePubKey<ST>>,
-        config: RaptorCastConfigSecondaryPublisher<ST>,
+        config: RaptorCastConfigSecondaryPublisher<CertificateSignaturePubKey<ST>>,
         rng: ChaCha8Rng,
     ) -> Self {
         let scheduling_cfg = config.group_scheduling;
@@ -126,7 +126,7 @@ where
         }
     }
 
-    fn new_empty_group(&self, start_round: Round) -> Group<ST> {
+    fn new_empty_group(&self, start_round: Round) -> Group<CertificateSignaturePubKey<ST>> {
         let end_round = start_round + self.scheduling_cfg.init_empty_round_span;
         let round_span = RoundSpan::new(start_round, end_round).expect("round is near Round::MAX");
 
@@ -182,7 +182,7 @@ where
 
         // Remove all groups that have ended.
         self.group_schedule
-            .retain(|_, group| group.end_round >= new_round);
+            .retain(|_, group| group.end_round > new_round);
 
         let Some(next_group) = self.group_schedule.first_entry() else {
             // We didn't manage to form a group in time for the new round.
@@ -329,7 +329,7 @@ where
         }
     }
 
-    pub fn get_current_raptorcast_group(&self) -> Option<&Group<ST>> {
+    pub fn get_current_raptorcast_group(&self) -> Option<&Group<CertificateSignaturePubKey<ST>>> {
         if self.curr_group.get_round_span().contains(self.curr_round) {
             Some(&self.curr_group)
         } else {
@@ -581,7 +581,7 @@ where
     pub fn to_finalized_group(
         &self,
         validator_id: NodeId<CertificateSignaturePubKey<ST>>,
-    ) -> Group<ST> {
+    ) -> Group<CertificateSignaturePubKey<ST>> {
         let round_span =
             RoundSpan::new(self.start_round, self.end_round).expect("invalid round span");
 
@@ -620,7 +620,10 @@ mod tests {
 
     type ST = SecpSignature;
     type PubKeyType = CertificateSignaturePubKey<ST>;
-    type RcToRcChannelGrp<ST> = (UnboundedSender<Group<ST>>, UnboundedReceiver<Group<ST>>);
+    type RcToRcChannelGrp = (
+        UnboundedSender<Group<PubKeyType>>,
+        UnboundedReceiver<Group<PubKeyType>>,
+    );
     type NodeIdST<ST> = NodeId<CertificateSignaturePubKey<ST>>;
 
     // Creates a node id that we can refer to just from its seed
@@ -739,7 +742,7 @@ mod tests {
         res
     }
 
-    fn dump_formed_grp(grp: &Group<ST>) -> String {
+    fn dump_formed_grp(grp: &Group<PubKeyType>) -> String {
         let mut res = String::new();
         let span = grp.get_round_span();
         res += format!("[{:?}-{:?})", span.start, span.end).as_str();
@@ -980,13 +983,13 @@ mod tests {
     // This is a mock of how the primary raptorcast instance would represent
     // the rebroadcast group map.
     struct MockGroupMap {
-        rx_from_client: UnboundedReceiver<Group<ST>>,
-        group_map: ReBroadcastGroupMap<ST>,
+        rx_from_client: UnboundedReceiver<Group<PubKeyType>>,
+        group_map: ReBroadcastGroupMap<PubKeyType>,
     }
     impl MockGroupMap {
         fn new(
-            clt_node_id: NodeId<CertificateSignaturePubKey<ST>>,
-            rx_from_client: UnboundedReceiver<Group<ST>>,
+            clt_node_id: NodeId<PubKeyType>,
+            rx_from_client: UnboundedReceiver<Group<PubKeyType>>,
         ) -> Self {
             Self {
                 group_map: ReBroadcastGroupMap::new(clt_node_id),
@@ -1388,7 +1391,7 @@ mod tests {
     #[test]
     fn client_avoid_one_round_gap() {
         enable_tracer();
-        let (clt_tx, clt_rx): RcToRcChannelGrp<ST> = unbounded_channel();
+        let (clt_tx, clt_rx): RcToRcChannelGrp = unbounded_channel();
         let mut clt =
             Client::<ST>::new(nid(10), clt_tx, RaptorCastConfigSecondaryClient::default());
         let mut group_map = MockGroupMap::new(nid(10), clt_rx);
@@ -1401,46 +1404,38 @@ mod tests {
             end_round: Round(start_round + 2),
         };
 
-        let make_invite_msg =
-            |start_round: u64| FullNodesGroupMessage::PrepareGroup(make_prep_data(start_round));
+        let make_invite_msg = |start_round: u64| make_prep_data(start_round);
 
-        let make_confirm_msg = |start_round: u64| {
-            FullNodesGroupMessage::ConfirmGroup(ConfirmGroup {
-                prepare: make_prep_data(start_round),
-                peers: node_ids_vec![10, 11],
-                name_records: Default::default(),
-            })
+        let make_confirm_msg = |start_round: u64| ConfirmGroup {
+            prepare: make_prep_data(start_round),
+            peers: node_ids_vec![10, 11],
+            name_records: Default::default(),
         };
 
         // Receive invite for rounds [50, 52)
-        let (group_msg, validator_id) = clt
-            .on_receive_group_message(make_invite_msg(50))
-            .expect("Client should have returned accept responses to be sent");
+        let invite_msg = make_invite_msg(50);
+        let validator_id = invite_msg.validator_id;
+        let reply_msg = clt.handle_prepare_group_message(invite_msg);
 
         assert_eq!(validator_id, nid(0));
-        let FullNodesGroupMessage::PrepareGroupResponse(reply_msg) = group_msg else {
-            panic!("Expected PrepareGroupResponse, got: {:?}", group_msg);
-        };
         assert!(reply_msg.accept);
         assert_eq!(reply_msg.node_id, nid(10));
         assert_eq!(reply_msg.req, make_prep_data(50));
 
-        let res = clt.on_receive_group_message(make_confirm_msg(50));
-        if res.is_some() {
-            panic!("Expected None from Client, got: {:?}", res);
-        }
+        let is_valid = clt.handle_confirm_group_message(make_confirm_msg(50));
+        assert!(is_valid, "ConfirmGroup for rounds [50, 52) should be valid");
 
         // Receive invite for rounds [52, 54), from V0
-        clt.on_receive_group_message(make_invite_msg(52));
-        clt.on_receive_group_message(make_confirm_msg(52));
+        clt.handle_prepare_group_message(make_invite_msg(52));
+        assert!(clt.handle_confirm_group_message(make_confirm_msg(52)));
 
         // Receive invite for rounds [60, 62), from V0
-        clt.on_receive_group_message(make_invite_msg(60));
-        clt.on_receive_group_message(make_confirm_msg(60));
+        clt.handle_prepare_group_message(make_invite_msg(60));
+        assert!(clt.handle_confirm_group_message(make_confirm_msg(60)));
 
         // Receive invite for rounds [62, 64), from V0
-        clt.on_receive_group_message(make_invite_msg(62));
-        clt.on_receive_group_message(make_confirm_msg(62));
+        clt.handle_prepare_group_message(make_invite_msg(62));
+        assert!(clt.handle_confirm_group_message(make_confirm_msg(62)));
 
         // Receive raptorcast with proposal 50
         let rc_grp = &group_map.get_rc_group_peers(&clt, &nid(0));
@@ -1496,7 +1491,7 @@ mod tests {
     #[test]
     fn standalone_client_single_group() {
         enable_tracer();
-        let (clt_tx, clt_rx): RcToRcChannelGrp<ST> = unbounded_channel();
+        let (clt_tx, clt_rx): RcToRcChannelGrp = unbounded_channel();
         let mut clt = Client::<ST>::new(
             nid(10),
             clt_tx,
@@ -1518,15 +1513,12 @@ mod tests {
             end_round: Round(start_round + 2),
         };
 
-        let make_invite_msg =
-            |start_round: u64| FullNodesGroupMessage::PrepareGroup(make_prep_data(start_round));
+        let make_invite_msg = |start_round: u64| make_prep_data(start_round);
 
-        let make_confirm_msg = |start_round: u64| {
-            FullNodesGroupMessage::ConfirmGroup(ConfirmGroup {
-                prepare: make_prep_data(start_round),
-                peers: node_ids_vec![10, 10 + start_round],
-                name_records: Default::default(),
-            })
+        let make_confirm_msg = |start_round: u64| ConfirmGroup {
+            prepare: make_prep_data(start_round),
+            peers: node_ids_vec![10, 10 + start_round],
+            name_records: Default::default(),
         };
 
         //-------------------------------------------------------------------[1]
@@ -1536,13 +1528,11 @@ mod tests {
         assert!(group_map.is_empty(&clt));
 
         // Receive invite for round [5, 7). It should be accepted.
-        let (group_msg, validator_id) = clt
-            .on_receive_group_message(make_invite_msg(5))
-            .expect("Client should have returned accept responses to be sent");
+        let invite_msg = make_invite_msg(5);
+        let validator_id = invite_msg.validator_id;
+        let reply_msg = clt.handle_prepare_group_message(invite_msg);
+
         assert_eq!(validator_id, nid(0));
-        let FullNodesGroupMessage::PrepareGroupResponse(reply_msg) = group_msg else {
-            panic!("Expected PrepareGroupResponse, got: {:?}", group_msg);
-        };
         assert!(reply_msg.accept);
         assert_eq!(reply_msg.node_id, nid(10));
         assert_eq!(reply_msg.req, make_prep_data(5));
@@ -1559,13 +1549,11 @@ mod tests {
 
         // Receive invite for round [8, 10). It should be accepted.
         // Note we have a group-less gap [7, 8)
-        let (group_msg, validator_id) = clt
-            .on_receive_group_message(make_invite_msg(8))
-            .expect("Client should have returned accept responses to be sent");
+        let invite_msg = make_invite_msg(8);
+        let validator_id = invite_msg.validator_id;
+        let reply_msg = clt.handle_prepare_group_message(invite_msg);
+
         assert_eq!(validator_id, nid(0));
-        let FullNodesGroupMessage::PrepareGroupResponse(reply_msg) = group_msg else {
-            panic!("Expected PrepareGroupResponse, got: {:?}", group_msg);
-        };
         assert!(reply_msg.accept);
         assert_eq!(reply_msg.node_id, nid(10));
         assert_eq!(reply_msg.req, make_prep_data(8));
@@ -1577,14 +1565,8 @@ mod tests {
         // This is the last opportunity to receive confirm for group 1.
         // Lets accept both here, out of order.
         assert_eq!(clt.num_pending_confirms(), 2);
-        let res = clt.on_receive_group_message(make_confirm_msg(8));
-        if res.is_some() {
-            panic!("Expected None from Client, got: {:?}", res);
-        }
-        let res = clt.on_receive_group_message(make_confirm_msg(5));
-        if res.is_some() {
-            panic!("Expected None from Client, got: {:?}", res);
-        }
+        assert!(clt.handle_confirm_group_message(make_confirm_msg(8)));
+        assert!(clt.handle_confirm_group_message(make_confirm_msg(5)));
 
         //-------------------------------------------------------------------[5]
         clt.enter_round(Round(5));
@@ -1625,7 +1607,7 @@ mod tests {
     #[test]
     fn mid_round_client_start() {
         enable_tracer();
-        let (clt_tx, clt_rx): RcToRcChannelGrp<ST> = unbounded_channel();
+        let (clt_tx, clt_rx): RcToRcChannelGrp = unbounded_channel();
         let mut clt = Client::<ST>::new(
             nid(10),
             clt_tx,
@@ -1646,15 +1628,12 @@ mod tests {
             end_round: Round(start_round + 2),
         };
 
-        let make_invite_msg =
-            |start_round: u64| FullNodesGroupMessage::PrepareGroup(make_prep_data(start_round));
+        let make_invite_msg = |start_round: u64| make_prep_data(start_round);
 
-        let make_confirm_msg = |start_round: u64| {
-            FullNodesGroupMessage::ConfirmGroup(ConfirmGroup {
-                prepare: make_prep_data(start_round),
-                peers: node_ids_vec![10, 10 + start_round],
-                name_records: Default::default(),
-            })
+        let make_confirm_msg = |start_round: u64| ConfirmGroup {
+            prepare: make_prep_data(start_round),
+            peers: node_ids_vec![10, 10 + start_round],
+            name_records: Default::default(),
         };
 
         //------------------------------------------------------------------[31]
@@ -1664,13 +1643,11 @@ mod tests {
         assert!(group_map.is_empty(&clt));
 
         // Receive invite for round [35, 37). It should be accepted.
-        let (group_msg, validator_id) = clt
-            .on_receive_group_message(make_invite_msg(35))
-            .expect("Client should have returned accept responses to be sent");
+        let invite_msg = make_invite_msg(35);
+        let validator_id = invite_msg.validator_id;
+        let reply_msg = clt.handle_prepare_group_message(invite_msg);
+
         assert_eq!(validator_id, nid(0));
-        let FullNodesGroupMessage::PrepareGroupResponse(reply_msg) = group_msg else {
-            panic!("Expected PrepareGroupResponse, got: {:?}", group_msg);
-        };
         assert!(reply_msg.accept);
         assert_eq!(reply_msg.node_id, nid(10));
         assert_eq!(reply_msg.req, make_prep_data(35));
@@ -1687,13 +1664,12 @@ mod tests {
 
         // Receive invite for round [38, 40). It should be accepted.
         // Note we have a group-less gap [37, 38)
-        let (group_msg, validator_id) = clt
-            .on_receive_group_message(make_invite_msg(38))
-            .expect("Client should have returned accept responses to be sent");
+
+        let invite_msg = make_invite_msg(38);
+        let validator_id = invite_msg.validator_id;
+        let reply_msg = clt.handle_prepare_group_message(invite_msg);
+
         assert_eq!(validator_id, nid(0));
-        let FullNodesGroupMessage::PrepareGroupResponse(reply_msg) = group_msg else {
-            panic!("Expected PrepareGroupResponse, got: {:?}", group_msg);
-        };
         assert!(reply_msg.accept);
         assert_eq!(reply_msg.node_id, nid(10));
         assert_eq!(reply_msg.req, make_prep_data(38));
@@ -1707,14 +1683,8 @@ mod tests {
         // Note that make_confirm_msg() return node ids = start_round + 10,
         // so the first node in the second group is 45
         assert_eq!(clt.num_pending_confirms(), 2);
-        let res = clt.on_receive_group_message(make_confirm_msg(38));
-        if res.is_some() {
-            panic!("Expected None from Client, got: {:?}", res);
-        }
-        let res = clt.on_receive_group_message(make_confirm_msg(35));
-        if res.is_some() {
-            panic!("Expected None from Client, got: {:?}", res);
-        }
+        assert!(clt.handle_confirm_group_message(make_confirm_msg(38)));
+        assert!(clt.handle_confirm_group_message(make_confirm_msg(35)));
 
         //------------------------------------------------------------------[35]
         clt.enter_round(Round(35));
@@ -1768,7 +1738,7 @@ mod tests {
         // 16       | v0.2  v1.1  v2.1
 
         let me = 10;
-        let (clt_tx, clt_rx): RcToRcChannelGrp<ST> = unbounded_channel();
+        let (clt_tx, clt_rx): RcToRcChannelGrp = unbounded_channel();
         let mut clt = Client::<ST>::new(
             nid(me),
             clt_tx,
@@ -1790,16 +1760,13 @@ mod tests {
             end_round: Round(start_round + 2),
         };
 
-        let invite_msg = |start_round: u64, validator_id: u64| {
-            FullNodesGroupMessage::PrepareGroup(invite_data(start_round, validator_id))
-        };
+        let make_invite_msg =
+            |start_round: u64, validator_id: u64| invite_data(start_round, validator_id);
 
-        let confirm_msg = |start_round: u64, validator_id: u64| {
-            FullNodesGroupMessage::ConfirmGroup(ConfirmGroup {
-                prepare: invite_data(start_round, validator_id),
-                peers: node_ids_vec![me, me + start_round],
-                name_records: Default::default(),
-            })
+        let make_confirm_msg = |start_round: u64, validator_id: u64| ConfirmGroup {
+            prepare: invite_data(start_round, validator_id),
+            peers: node_ids_vec![me, me + start_round],
+            name_records: Default::default(),
         };
 
         //-------------------------------------------------------------------[1]
@@ -1813,28 +1780,24 @@ mod tests {
         // 10       |       v1.0
 
         // Invite v0.0
-        let (group_msg, validator_id) = clt
-            .on_receive_group_message(invite_msg(8, 0))
-            .expect("Client should have returned accept responses to be sent");
+        let invite_msg = make_invite_msg(8, 0);
+        let validator_id = invite_msg.validator_id;
+        let reply_msg = clt.handle_prepare_group_message(invite_msg);
+
         assert_eq!(validator_id, nid(0));
-        let FullNodesGroupMessage::PrepareGroupResponse(reply_msg) = group_msg else {
-            panic!("Expected PrepareGroupResponse, got: {:?}", group_msg);
-        };
         assert!(reply_msg.accept);
         assert_eq!(reply_msg.req, invite_data(8, 0));
-        assert!(clt.on_receive_group_message(confirm_msg(8, 0)).is_none());
+        assert!(clt.handle_confirm_group_message(make_confirm_msg(8, 0)));
 
         // Invite v1.0
-        let (group_msg, validator_id) = clt
-            .on_receive_group_message(invite_msg(9, 1))
-            .expect("Client should have returned accept responses to be sent");
+        let invite_msg = make_invite_msg(9, 1);
+        let validator_id = invite_msg.validator_id;
+        let reply_msg = clt.handle_prepare_group_message(invite_msg);
+
         assert_eq!(validator_id, nid(1));
-        let FullNodesGroupMessage::PrepareGroupResponse(reply_msg) = group_msg else {
-            panic!("Expected PrepareGroupResponse, got: {:?}", group_msg);
-        };
         assert!(reply_msg.accept);
         assert_eq!(reply_msg.req, invite_data(9, 1));
-        assert!(clt.on_receive_group_message(confirm_msg(9, 1)).is_none());
+        assert!(clt.handle_confirm_group_message(make_confirm_msg(9, 1)));
 
         //-------------------------------------------------------------------[2]
         clt.enter_round(Round(2));
@@ -1847,28 +1810,24 @@ mod tests {
         // 12       | v0.1
 
         // Invite v2.0
-        let (group_msg, validator_id) = clt
-            .on_receive_group_message(invite_msg(me, 2))
-            .expect("Client should have returned accept responses to be sent");
+        let invite_msg = make_invite_msg(me, 2);
+        let validator_id = invite_msg.validator_id;
+        let reply_msg = clt.handle_prepare_group_message(invite_msg);
+
         assert_eq!(validator_id, nid(2));
-        let FullNodesGroupMessage::PrepareGroupResponse(reply_msg) = group_msg else {
-            panic!("Expected PrepareGroupResponse, got: {:?}", group_msg);
-        };
         assert!(reply_msg.accept);
         assert_eq!(reply_msg.req, invite_data(me, 2));
-        assert!(clt.on_receive_group_message(confirm_msg(me, 2)).is_none());
+        assert!(clt.handle_confirm_group_message(make_confirm_msg(me, 2)));
 
         // Invite v0.1
-        let (group_msg, validator_id) = clt
-            .on_receive_group_message(invite_msg(11, 0))
-            .expect("Client should have returned accept responses to be sent");
+        let invite_msg = make_invite_msg(11, 0);
+        let validator_id = invite_msg.validator_id;
+        let reply_msg = clt.handle_prepare_group_message(invite_msg);
+
         assert_eq!(validator_id, nid(0));
-        let FullNodesGroupMessage::PrepareGroupResponse(reply_msg) = group_msg else {
-            panic!("Expected PrepareGroupResponse, got: {:?}", group_msg);
-        };
         assert!(reply_msg.accept);
         assert_eq!(reply_msg.req, invite_data(11, 0));
-        assert!(clt.on_receive_group_message(confirm_msg(11, 0)).is_none());
+        assert!(clt.handle_confirm_group_message(make_confirm_msg(11, 0)));
 
         //-------------------------------------------------------------------[3]
         clt.enter_round(Round(3));
@@ -1881,39 +1840,33 @@ mod tests {
         // 16       | v0.2  v1.1  v2.1
 
         // Invite v0.2
-        let (group_msg, validator_id) = clt
-            .on_receive_group_message(invite_msg(14, 0))
-            .expect("Client should have returned accept responses to be sent");
+        let invite_msg = make_invite_msg(14, 0);
+        let validator_id = invite_msg.validator_id;
+        let reply_msg = clt.handle_prepare_group_message(invite_msg);
+
         assert_eq!(validator_id, nid(0));
-        let FullNodesGroupMessage::PrepareGroupResponse(reply_msg) = group_msg else {
-            panic!("Expected PrepareGroupResponse, got: {:?}", group_msg);
-        };
         assert!(reply_msg.accept);
         assert_eq!(reply_msg.req, invite_data(14, 0));
-        assert!(clt.on_receive_group_message(confirm_msg(14, 0)).is_none());
+        assert!(clt.handle_confirm_group_message(make_confirm_msg(14, 0)));
 
         // Invite v1.1
-        let (group_msg, validator_id) = clt
-            .on_receive_group_message(invite_msg(14, 1))
-            .expect("Client should have returned accept responses to be sent");
+        let invite_msg = make_invite_msg(14, 1);
+        let validator_id = invite_msg.validator_id;
+        let reply_msg = clt.handle_prepare_group_message(invite_msg);
+
         assert_eq!(validator_id, nid(1));
-        let FullNodesGroupMessage::PrepareGroupResponse(reply_msg) = group_msg else {
-            panic!("Expected PrepareGroupResponse, got: {:?}", group_msg);
-        };
         assert!(reply_msg.accept);
         assert_eq!(reply_msg.req, invite_data(14, 1));
-        assert!(clt.on_receive_group_message(confirm_msg(14, 1)).is_none());
+        assert!(clt.handle_confirm_group_message(make_confirm_msg(14, 1)));
 
         // Invite v2.1
-        let (group_msg, validator_id) = clt
-            .on_receive_group_message(invite_msg(14, 2))
-            .expect("Client should have returned accept responses to be sent");
+        let invite_msg = make_invite_msg(14, 2);
+        let validator_id = invite_msg.validator_id;
+        let reply_msg = clt.handle_prepare_group_message(invite_msg);
+
         assert_eq!(validator_id, nid(2));
-        let FullNodesGroupMessage::PrepareGroupResponse(reply_msg) = group_msg else {
-            panic!("Expected PrepareGroupResponse, got: {:?}", group_msg);
-        };
         assert_eq!(reply_msg.req, invite_data(14, 2));
-        assert!(clt.on_receive_group_message(confirm_msg(14, 2)).is_none());
+        assert!(clt.handle_confirm_group_message(make_confirm_msg(14, 2)));
 
         //-----------------------------------------------------------------[4-7]
         // Simulated gap - no receiving proposals
@@ -2320,5 +2273,94 @@ mod tests {
         } else {
             panic!("Expected a group to be scheduled for round 8");
         }
+    }
+
+    #[test]
+    fn group_garbage_cleaning() {
+        let sched_cfg = GroupSchedulingConfig {
+            max_group_size: 1,
+            round_span: Round(5),
+            invite_lookahead: Round(100),
+            max_invite_wait: Round(2),
+            deadline_round_dist: Round(10),
+            init_empty_round_span: Round(20),
+        };
+
+        let mut v0_fsm: Publisher<ST> = Publisher::new(
+            nid(0),
+            RaptorCastConfigSecondaryPublisher {
+                full_nodes_prioritized: vec![nid(10)],
+                group_scheduling: sched_cfg,
+            },
+            ChaCha8Rng::seed_from_u64(42),
+        );
+
+        // The first group starts at round 21 because of init_empty_round_span =
+        // 20
+        //
+        // Create two groups [21, 26), [26, 31)
+        let (group_msg, _invitees) = v0_fsm
+            .enter_round_and_step_until(Round(1))
+            .expect("PrepareGroup message");
+
+        let FullNodesGroupMessage::PrepareGroup(invite_msg) = group_msg else {
+            panic!("Expected FullNodesGroupMessage::PrepareGroup");
+        };
+        assert_eq!(invite_msg.start_round, Round(21));
+        assert_eq!(invite_msg.end_round, Round(26));
+
+        let (group_msg, _invitees) = v0_fsm
+            .enter_round_and_step_until(Round(2))
+            .expect("PrepareGroup message");
+
+        let FullNodesGroupMessage::PrepareGroup(invite_msg) = group_msg else {
+            panic!("Expected FullNodesGroupMessage::PrepareGroup");
+        };
+        assert_eq!(invite_msg.start_round, Round(26));
+        assert_eq!(invite_msg.end_round, Round(31));
+
+        // Full node accepts both groups. enter_round_and_step_until drives the
+        // state machine to confirm those groups
+        let accept_msg = make_invite_response(nid(0), nid(10), true, Round(21), &sched_cfg);
+        v0_fsm.on_candidate_response(accept_msg);
+        // Confirm first group
+        let (group_msg, _invitees) = v0_fsm
+            .enter_round_and_step_until(Round(3))
+            .expect("ConfirmGroup message");
+        let FullNodesGroupMessage::ConfirmGroup(confirm_group) = group_msg else {
+            panic!("Expected FullNodesGroupMessage::ConfirmGroup");
+        };
+        assert_eq!(confirm_group.prepare.start_round, Round(21));
+
+        let accept_msg = make_invite_response(nid(0), nid(10), true, Round(26), &sched_cfg);
+        v0_fsm.on_candidate_response(accept_msg);
+
+        // Confirm second group
+        let (group_msg, _invitees) = v0_fsm
+            .enter_round_and_step_until(Round(4))
+            .expect("ConfirmGroup message");
+        let FullNodesGroupMessage::ConfirmGroup(confirm_group) = group_msg else {
+            panic!("Expected FullNodesGroupMessage::ConfirmGroup");
+        };
+        assert_eq!(confirm_group.prepare.start_round, Round(26));
+
+        // All groups are scheduled
+        assert!(v0_fsm.group_schedule.contains_key(&Round(21)));
+        assert!(v0_fsm.group_schedule.contains_key(&Round(26)));
+
+        v0_fsm.enter_round_and_step_until(Round(26));
+        assert!(
+            !v0_fsm.group_schedule.contains_key(&Round(21)),
+            "Group [21, 26) with end_round=26 should be purged (26 <= 26)"
+        );
+        assert!(
+            v0_fsm
+                .get_current_raptorcast_group()
+                .expect("current group is set")
+                .get_round_span()
+                .start
+                == Round(26),
+            "Group [26, 31) should be present and set as current group"
+        );
     }
 }

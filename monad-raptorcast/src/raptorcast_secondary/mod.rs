@@ -30,7 +30,7 @@ use client::Client;
 use futures::{Future, Stream};
 use group_message::FullNodesGroupMessage;
 use monad_crypto::certificate_signature::{
-    CertificateKeyPair, CertificateSignaturePubKey, CertificateSignatureRecoverable,
+    CertificateKeyPair, CertificateSignaturePubKey, CertificateSignatureRecoverable, PubKey,
 };
 use monad_executor::{Executor, ExecutorMetrics, ExecutorMetricsChain};
 use monad_executor_glue::{Message, PeerEntry, RouterCommand};
@@ -58,15 +58,15 @@ pub enum SecondaryRaptorCastModeConfig {
 }
 
 #[derive(Debug, Clone)]
-pub enum SecondaryOutboundMessage<ST: CertificateSignatureRecoverable> {
+pub enum SecondaryOutboundMessage<PT: PubKey> {
     SendSingle {
         msg_bytes: bytes::Bytes,
-        dest: NodeId<CertificateSignaturePubKey<ST>>,
+        dest: NodeId<PT>,
         group_id: GroupId,
     },
     SendToGroup {
         msg_bytes: bytes::Bytes,
-        group: Group<ST>,
+        group: Group<PT>,
         group_id: GroupId,
     },
 }
@@ -97,7 +97,9 @@ where
     peer_discovery_driver: Arc<Mutex<PeerDiscoveryDriver<PD>>>,
 
     channel_from_primary: UnboundedReceiver<FullNodesGroupMessage<ST>>,
-    channel_to_primary_outbound: UnboundedSender<SecondaryOutboundMessage<ST>>,
+    channel_to_primary_outbound:
+        UnboundedSender<SecondaryOutboundMessage<CertificateSignaturePubKey<ST>>>,
+
     #[expect(unused)]
     metrics: ExecutorMetrics,
     _phantom: PhantomData<(OM, SE, M)>,
@@ -112,11 +114,13 @@ where
 {
     pub fn new(
         config: RaptorCastConfig<ST>,
-        secondary_mode: SecondaryRaptorCastMode<ST>,
+        secondary_mode: SecondaryRaptorCastMode<CertificateSignaturePubKey<ST>>,
         peer_discovery_driver: Arc<Mutex<PeerDiscoveryDriver<PD>>>,
         channel_from_primary: UnboundedReceiver<FullNodesGroupMessage<ST>>,
-        channel_to_primary: UnboundedSender<Group<ST>>,
-        channel_to_primary_outbound: UnboundedSender<SecondaryOutboundMessage<ST>>,
+        channel_to_primary: UnboundedSender<Group<CertificateSignaturePubKey<ST>>>,
+        channel_to_primary_outbound: UnboundedSender<
+            SecondaryOutboundMessage<CertificateSignaturePubKey<ST>>,
+        >,
         current_epoch: Epoch,
     ) -> Self {
         let node_id = NodeId::new(config.shared_key.pubkey());
@@ -334,7 +338,7 @@ where
                     round,
                     message,
                 } => {
-                    let curr_group: Group<ST> = match &mut self.role {
+                    let curr_group: Group<_> = match &mut self.role {
                         Role::Client(_) => {
                             continue;
                         }
@@ -383,7 +387,7 @@ where
         }
     }
 
-    fn metrics(&self) -> ExecutorMetricsChain {
+    fn metrics(&self) -> ExecutorMetricsChain<'_> {
         match &self.role {
             Role::Publisher(publisher) => publisher.metrics().into(),
             Role::Client(client) => client.metrics().into(),
@@ -430,53 +434,70 @@ where
             Role::Client(client) => {
                 trace!("RaptorCastSecondary received group message");
                 // Received group message from validator
-                if let FullNodesGroupMessage::ConfirmGroup(confirm_msg) = &inbound_grp_msg {
-                    let num_mappings = confirm_msg.name_records.len();
-                    if num_mappings > 0 && num_mappings == confirm_msg.peers.len() {
-                        let mut peers: Vec<PeerEntry<ST>> = Vec::new();
-                        // FIXME: bind name records with peers and ask peer discovery to verify
-                        for ii in 0..num_mappings {
-                            let rec = &confirm_msg.name_records[ii];
-                            peers.push(rec.with_pubkey(confirm_msg.peers[ii].pubkey()).into());
-                        }
-                        this.peer_discovery_driver
-                            .lock()
-                            .unwrap()
-                            .update(PeerDiscoveryEvent::UpdatePeers { peers });
+                match inbound_grp_msg {
+                    FullNodesGroupMessage::PrepareGroup(invite_msg) => {
+                        let dest_node_id = invite_msg.validator_id;
+                        let resp = client.handle_prepare_group_message(invite_msg);
 
-                        // participated_nodes contains the validator and all full nodes in the group
-                        let mut participated_nodes: BTreeSet<
-                            NodeId<CertificateSignaturePubKey<ST>>,
-                        > = confirm_msg.peers.clone().into_iter().collect();
-                        participated_nodes.insert(confirm_msg.prepare.validator_id);
-                        this.peer_discovery_driver.lock().unwrap().update(
-                            PeerDiscoveryEvent::UpdateConfirmGroup {
-                                end_round: confirm_msg.prepare.end_round,
-                                peers: participated_nodes.clone(),
-                            },
-                        );
-
-                        ret = Poll::Ready(Some(
-                            RaptorCastEvent::SecondaryRaptorcastPeersUpdate(
-                                confirm_msg.prepare.end_round,
-                                participated_nodes.into_iter().collect(),
-                            )
-                            .into(),
-                        ));
-                    } else if num_mappings > 0 {
-                        warn!( ?confirm_msg, num_peers =? confirm_msg.peers.len(), num_name_recs =? confirm_msg.name_records.len(),
-                            "Number of peers does not match the number \
-                            of name records in ConfirmGroup message. \
-                            Skipping PeerDiscovery update"
+                        // Send back a response to the validator
+                        trace!("RaptorCastSecondary sending back response for group message");
+                        this.send_single_msg(
+                            FullNodesGroupMessage::PrepareGroupResponse(resp),
+                            dest_node_id,
                         );
                     }
-                }
-                if let Some((response_msg, validator_id)) =
-                    client.on_receive_group_message(inbound_grp_msg)
-                {
-                    // Send back a response to the validator
-                    trace!("RaptorCastSecondary sending back response for group message");
-                    this.send_single_msg(response_msg, validator_id);
+                    FullNodesGroupMessage::PrepareGroupResponse(_) => {
+                        error!(
+                            "RaptorCastSecondary client received a \
+                                PrepareGroupResponse message"
+                        );
+                    }
+                    FullNodesGroupMessage::ConfirmGroup(confirm_msg) => {
+                        let is_valid = client.handle_confirm_group_message(confirm_msg.clone());
+                        if is_valid {
+                            // Update peer discovery with peers from confirm group message
+                            let num_mappings = confirm_msg.name_records.len();
+                            if num_mappings > 0 && num_mappings == confirm_msg.peers.len() {
+                                let peers: Vec<PeerEntry<ST>> = confirm_msg
+                                    .name_records
+                                    .iter()
+                                    .zip(confirm_msg.peers.iter())
+                                    .map(|(rec, peer)| rec.with_pubkey(peer.pubkey()).into())
+                                    .collect();
+
+                                this.peer_discovery_driver
+                                    .lock()
+                                    .unwrap()
+                                    .update(PeerDiscoveryEvent::UpdatePeers { peers });
+
+                                // participated_nodes contains the validator and all full nodes in the group
+                                let mut participated_nodes: BTreeSet<
+                                    NodeId<CertificateSignaturePubKey<ST>>,
+                                > = confirm_msg.peers.clone().into_iter().collect();
+                                participated_nodes.insert(confirm_msg.prepare.validator_id);
+                                this.peer_discovery_driver.lock().unwrap().update(
+                                    PeerDiscoveryEvent::UpdateConfirmGroup {
+                                        end_round: confirm_msg.prepare.end_round,
+                                        peers: participated_nodes.clone(),
+                                    },
+                                );
+
+                                ret = Poll::Ready(Some(
+                                    RaptorCastEvent::SecondaryRaptorcastPeersUpdate(
+                                        confirm_msg.prepare.end_round,
+                                        participated_nodes.into_iter().collect(),
+                                    )
+                                    .into(),
+                                ));
+                            } else if num_mappings > 0 {
+                                warn!( ?confirm_msg, num_peers =? confirm_msg.peers.len(), num_name_recs =? confirm_msg.name_records.len(),
+                                    "Number of peers does not match the number \
+                                    of name records in ConfirmGroup message. \
+                                    Skipping PeerDiscovery update"
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }

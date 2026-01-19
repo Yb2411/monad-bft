@@ -16,6 +16,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     net::SocketAddrV4,
+    num::NonZeroU32,
     path::PathBuf,
     time::Duration,
 };
@@ -39,6 +40,13 @@ use crate::{
     ipv4_validation::{IpCheckError, validate_socket_ipv4_address},
 };
 
+type RateLimiter = governor::RateLimiter<
+    governor::state::NotKeyed,
+    governor::state::InMemoryState,
+    governor::clock::QuantaClock,
+    governor::middleware::NoOpMiddleware<governor::clock::QuantaInstant>,
+>;
+
 /// Maximum number of peers to be included in a PeerLookupResponse
 const MAX_PEER_IN_RESPONSE: usize = 16;
 /// Number of peers to send lookup request to
@@ -55,6 +63,7 @@ pub const GAUGE_PEER_DISC_PING_TIMEOUT: &str = "monad.peer_disc.ping_timeout";
 pub const GAUGE_PEER_DISC_SEND_PONG: &str = "monad.peer_disc.send_pong";
 pub const GAUGE_PEER_DISC_RECV_PONG: &str = "monad.peer_disc.recv_pong";
 pub const GAUGE_PEER_DISC_DROP_PONG: &str = "monad.peer_disc.drop_pong";
+pub const GAUGE_PEER_DISC_RATE_LIMITED: &str = "monad.peer_disc.rate_limited";
 pub const GAUGE_PEER_DISC_SEND_LOOKUP_REQUEST: &str = "monad.peer_disc.send_lookup_request";
 pub const GAUGE_PEER_DISC_RECV_LOOKUP_REQUEST: &str = "monad.peer_disc.recv_lookup_request";
 pub const GAUGE_PEER_DISC_RECV_OPEN_LOOKUP_REQUEST: &str =
@@ -78,6 +87,7 @@ pub const GAUGE_PEER_DISC_NUM_PENDING_PEERS: &str = "monad.peer_disc.num_pending
 pub const GAUGE_PEER_DISC_NUM_UPSTREAM_VALIDATORS: &str = "monad.peer_disc.num_upstream_validators";
 pub const GAUGE_PEER_DISC_NUM_DOWNSTREAM_FULLNODES: &str =
     "monad.peer_disc.num_downstream_fullnodes";
+pub const GAUGE_PEER_DISC_SOCKET_COLLISIONS: &str = "monad.peer_disc.socket_collisions";
 
 /// validator role is given if the node is a validator in the current or next epoch.
 /// this is to ensure the node starts connecting to other validators even if joining
@@ -145,6 +155,9 @@ pub struct PeerDiscovery<ST: CertificateSignatureRecoverable> {
     // a node is inserted into pending_queue and only promoted to routing_info upon a successful ping pong roundtrip
     // this is to ensure the node is reachable at its ip address and port
     pub pending_queue: BTreeMap<NodeId<CertificateSignaturePubKey<ST>>, ConnectionInfo<ST>>,
+    // mapping to keep track of socket address to node ID
+    // used to prevent multiple node IDs from trying to bind to the same ip address and port
+    pub socket_to_id: BTreeMap<SocketAddrV4, NodeId<CertificateSignaturePubKey<ST>>>,
     // mapping of lookup IDs to their corresponding lookup info, node will only entertain lookup response
     // that matches a local lookup ID
     pub outstanding_lookup_requests: HashMap<u32, LookupInfo<ST>>,
@@ -169,6 +182,8 @@ pub struct PeerDiscovery<ST: CertificateSignatureRecoverable> {
     pub enable_client: bool,
     pub rng: ChaCha8Rng,
     pub persisted_peers_path: PathBuf,
+    // rate limiter for incoming pings
+    ping_rate_limiter: RateLimiter,
 }
 
 pub struct PeerDiscoveryBuilder<ST: CertificateSignatureRecoverable> {
@@ -191,6 +206,7 @@ pub struct PeerDiscoveryBuilder<ST: CertificateSignatureRecoverable> {
     pub enable_client: bool,
     pub rng: ChaCha8Rng,
     pub persisted_peers_path: PathBuf,
+    pub ping_rate_limit_per_second: u32,
 }
 
 impl<ST: CertificateSignatureRecoverable> PeerDiscoveryAlgoBuilder for PeerDiscoveryBuilder<ST> {
@@ -251,6 +267,7 @@ impl<ST: CertificateSignatureRecoverable> PeerDiscoveryAlgoBuilder for PeerDisco
             routing_info: Default::default(),
             participation_info: Default::default(),
             pending_queue: Default::default(),
+            socket_to_id: Default::default(),
             outstanding_lookup_requests: Default::default(),
             metrics: Default::default(),
             refresh_period: self.refresh_period,
@@ -264,6 +281,12 @@ impl<ST: CertificateSignatureRecoverable> PeerDiscoveryAlgoBuilder for PeerDisco
             enable_client: self.enable_client,
             rng: self.rng,
             persisted_peers_path: self.persisted_peers_path,
+            ping_rate_limiter: governor::RateLimiter::direct(
+                governor::Quota::per_second(
+                    NonZeroU32::new(self.ping_rate_limit_per_second).unwrap(),
+                )
+                .allow_burst(NonZeroU32::new(self.ping_rate_limit_per_second).unwrap()),
+            ),
         };
 
         let mut cmds = Vec::new();
@@ -461,7 +484,7 @@ impl<ST: CertificateSignatureRecoverable> PeerDiscovery<ST> {
     ) -> Vec<PeerDiscoveryCommand<ST>> {
         let mut cmds = Vec::new();
 
-        self.routing_info.insert(peer, name_record);
+        let old_name_record = self.routing_info.insert(peer, name_record.clone());
         self.participation_info
             .entry(peer)
             .and_modify(|info| {
@@ -476,6 +499,20 @@ impl<ST: CertificateSignatureRecoverable> PeerDiscovery<ST> {
             });
         cmds.extend(self.remove_peer_from_pending(peer));
         self.metrics[GAUGE_PEER_DISC_NUM_PEERS] = self.routing_info.len() as u64;
+
+        // clean up old socket bindings if name record is updated
+        if let Some(record) = old_name_record {
+            self.socket_to_id.remove(&record.udp_address());
+            if let Some(auth_socket) = record.authenticated_udp_address() {
+                self.socket_to_id.remove(&auth_socket);
+            }
+        }
+
+        // record socket addresses to node id
+        self.socket_to_id.insert(name_record.udp_address(), peer);
+        if let Some(auth_socket) = name_record.authenticated_udp_address() {
+            self.socket_to_id.insert(auth_socket, peer);
+        }
 
         if self.self_role == PeerDiscoveryRole::FullNodeClient {
             cmds.extend(self.look_for_upstream_validators());
@@ -700,6 +737,26 @@ impl<ST: CertificateSignatureRecoverable> PeerDiscovery<ST> {
 
         cmds
     }
+
+    fn check_socket_availability(
+        &mut self,
+        from: &NodeId<CertificateSignaturePubKey<ST>>,
+        socket: &SocketAddrV4,
+    ) -> bool {
+        if let Some(expected_node_id) = self.socket_to_id.get(socket)
+            && expected_node_id != from
+        {
+            warn!(
+                ?from,
+                ?socket,
+                ?expected_node_id,
+                "socket address already bound to another node ID"
+            );
+            self.metrics[GAUGE_PEER_DISC_SOCKET_COLLISIONS] += 1;
+            return false;
+        }
+        true
+    }
 }
 
 impl<ST> PeerDiscoveryAlgo for PeerDiscovery<ST>
@@ -740,6 +797,38 @@ where
 
         let mut cmds = Vec::new();
 
+        // check rate limit for incoming pings
+        if self.ping_rate_limiter.check().is_err() {
+            debug!(?from, "ping rate limit exceeded, dropping ping");
+            self.metrics[GAUGE_PEER_DISC_RATE_LIMITED] += 1;
+            return cmds;
+        }
+
+        // do not accept pings from socket address that is already bound to another node ID
+        let incoming_socket = ping_msg.local_name_record.udp_address();
+        let incoming_authenticated_socket = ping_msg.local_name_record.authenticated_udp_address();
+        if !self.check_socket_availability(&from, &incoming_socket) {
+            return cmds;
+        }
+        if let Some(auth_socket) = incoming_authenticated_socket
+            && !self.check_socket_availability(&from, &auth_socket)
+        {
+            return cmds;
+        }
+
+        // do not process ping if node id recovered from name record does not match sender node id
+        let peer_name_record = ping_msg.local_name_record.clone();
+        if !peer_name_record
+            .recover_pubkey()
+            .is_ok_and(|recovered_node_id| recovered_node_id == from)
+        {
+            debug!(
+                ?from,
+                "ping sender node ID does not match recovered node ID from name record, dropping ping"
+            );
+            return cmds;
+        }
+
         // do not insert to pending queue if peer list is full and incoming ping is not from a validator or pinned full node
         // we still respond with pong even if peer list is full
         let mut peer_list_full = false;
@@ -756,24 +845,14 @@ where
         }
 
         if !peer_list_full {
-            let peer_name_record = ping_msg.local_name_record.clone();
             if self
                 .routing_info
                 .get(&from)
                 .is_none_or(|local| peer_name_record.seq() > local.seq())
             {
-                let verified = peer_name_record
-                    .recover_pubkey()
-                    .is_ok_and(|recovered_node_id| recovered_node_id == from);
-
-                if verified {
-                    match self.insert_peer_to_pending(from, peer_name_record) {
-                        Ok(cmds_from_insert) => cmds.extend(cmds_from_insert),
-                        Err(_) => return cmds,
-                    }
-                } else {
-                    debug!("invalid signature in ping.local_name_record");
-                    return cmds;
+                match self.insert_peer_to_pending(from, peer_name_record) {
+                    Ok(cmds_from_insert) => cmds.extend(cmds_from_insert),
+                    Err(_) => return cmds,
                 }
             } else if self
                 .routing_info
@@ -1297,7 +1376,13 @@ where
             } else {
                 debug!(?node_id, "removing non-participating peer");
                 self.participation_info.remove(&node_id);
-                self.routing_info.remove(&node_id);
+                let old_name_record = self.routing_info.remove(&node_id);
+                if let Some(record) = old_name_record {
+                    self.socket_to_id.remove(&record.udp_address());
+                    if let Some(auth_socket) = record.authenticated_udp_address() {
+                        self.socket_to_id.remove(&auth_socket);
+                    }
+                }
             }
         }
 
@@ -1322,7 +1407,13 @@ where
                 for node_id in nodes_to_prune {
                     debug!(?node_id, "pruning excessive full nodes");
                     self.participation_info.remove(&node_id);
-                    self.routing_info.remove(&node_id);
+                    let old_name_record = self.routing_info.remove(&node_id);
+                    if let Some(record) = old_name_record {
+                        self.socket_to_id.remove(&record.udp_address());
+                        if let Some(auth_socket) = record.authenticated_udp_address() {
+                            self.socket_to_id.remove(&auth_socket);
+                        }
+                    }
                 }
             }
         }
@@ -1526,6 +1617,21 @@ where
         let mut cmds = Vec::new();
         for peer in peers {
             let node_id = NodeId::new(peer.pubkey);
+
+            // do not accept peers from socket address that is already bound to another node ID
+            let incoming_socket = peer.addr;
+            let incoming_authenticated_socket = peer
+                .auth_port
+                .map(|port| SocketAddrV4::new(*peer.addr.ip(), port));
+            if !self.check_socket_availability(&node_id, &incoming_socket) {
+                continue;
+            }
+            if let Some(auth_socket) = incoming_authenticated_socket
+                && !self.check_socket_availability(&node_id, &auth_socket)
+            {
+                continue;
+            }
+
             match (&peer).try_into() {
                 Ok(name_record) => match self.insert_peer_to_pending(node_id, name_record) {
                     Ok(cmds_from_insert) => cmds.extend(cmds_from_insert),
@@ -1657,7 +1763,8 @@ mod tests {
     use alloy_rlp::Encodable;
     use monad_crypto::{
         NopKeyPair, NopSignature,
-        certificate_signature::{CertificateKeyPair, CertificateSignature},
+        certificate_signature::{CertificateKeyPair, CertificateSignature, PubKey},
+        hasher::{Hasher, HasherType},
         signing_domain,
     };
     use monad_testutil::signing::create_keys;
@@ -1674,7 +1781,22 @@ mod tests {
     const DUMMY_ADDR: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(1, 1, 1, 1), 8000);
 
     fn generate_name_record(keypair: &KeyPairType, seq_num: u64) -> MonadNameRecord<SignatureType> {
-        let name_record = NameRecord::new(*DUMMY_ADDR.ip(), DUMMY_ADDR.port(), seq_num);
+        let mut hasher = HasherType::new();
+        hasher.update(keypair.pubkey().bytes());
+        let hash = hasher.hash();
+        let ipaddr_v4 = Ipv4Addr::from_bits(u32::from_be_bytes(hash.0[28..32].try_into().unwrap()));
+        let name_record = NameRecord::new(ipaddr_v4, 8000 + seq_num as u16, seq_num);
+        let mut encoded = Vec::new();
+        name_record.encode(&mut encoded);
+        let signature = SignatureType::sign::<signing_domain::NameRecord>(&encoded, keypair);
+        MonadNameRecord {
+            name_record,
+            signature,
+        }
+    }
+
+    fn generate_dummy_name_record(keypair: &KeyPairType) -> MonadNameRecord<SignatureType> {
+        let name_record = NameRecord::new(*DUMMY_ADDR.ip(), DUMMY_ADDR.port(), 0);
         let mut encoded = Vec::new();
         name_record.encode(&mut encoded);
         let signature = SignatureType::sign::<signing_domain::NameRecord>(&encoded, keypair);
@@ -1698,6 +1820,7 @@ mod tests {
             })
             .collect::<BTreeMap<_, _>>();
         let participation_info = peer_keys
+            .clone()
             .into_iter()
             .map(|key| {
                 let node_id = NodeId::new(key.pubkey());
@@ -1710,6 +1833,14 @@ mod tests {
                         last_active: Round(0),
                     },
                 )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let socket_to_id = peer_keys
+            .into_iter()
+            .map(|key| {
+                let node_id = NodeId::new(key.pubkey());
+                let name_record = generate_name_record(key, 0);
+                (name_record.udp_address(), node_id)
             })
             .collect::<BTreeMap<_, _>>();
 
@@ -1726,6 +1857,7 @@ mod tests {
             routing_info,
             participation_info,
             pending_queue: BTreeMap::new(),
+            socket_to_id,
             outstanding_lookup_requests: HashMap::new(),
             metrics: ExecutorMetrics::default(),
             refresh_period: Duration::from_secs(120),
@@ -1739,6 +1871,10 @@ mod tests {
             enable_client: false,
             rng: ChaCha8Rng::seed_from_u64(123456),
             persisted_peers_path: Default::default(),
+            ping_rate_limiter: governor::RateLimiter::direct(
+                governor::Quota::per_second(NonZeroU32::new(100).unwrap())
+                    .allow_burst(NonZeroU32::new(100).unwrap()),
+            ),
         }
     }
 
@@ -1869,6 +2005,53 @@ mod tests {
         let connection_info = state.pending_queue.get(&peer1_pubkey);
         assert!(connection_info.is_some());
         assert_eq!(connection_info.unwrap().last_ping, last_ping);
+    }
+
+    #[test]
+    fn test_rate_limit_pings() {
+        let keys = create_keys::<SignatureType>(2);
+        let peer0 = &keys[0];
+        let peer1 = &keys[1];
+        let peer1_pubkey = NodeId::new(peer1.pubkey());
+
+        let mut state = generate_test_state(peer0, vec![]);
+
+        // handle pings up to rate limit (100 pings per second)
+        let peer_name_record = generate_name_record(peer1, 0);
+        for i in 0..100 {
+            let cmds = state.handle_ping(
+                peer1_pubkey,
+                Ping {
+                    id: i,
+                    local_name_record: peer_name_record.clone(),
+                },
+            );
+            assert_ne!(cmds.len(), 0); // should not drop pings
+        }
+
+        // next ping should be rate limited and dropped
+        let cmds = state.handle_ping(
+            peer1_pubkey,
+            Ping {
+                id: 101,
+                local_name_record: peer_name_record.clone(),
+            },
+        );
+        assert_eq!(cmds.len(), 0); // should be rate limited and dropped
+        assert_eq!(state.metrics[GAUGE_PEER_DISC_RATE_LIMITED], 1);
+
+        // advance time by 1 second
+        std::thread::sleep(Duration::from_secs(1));
+
+        // next ping should be accepted
+        let cmds = state.handle_ping(
+            peer1_pubkey,
+            Ping {
+                id: 102,
+                local_name_record: peer_name_record,
+            },
+        );
+        assert_ne!(cmds.len(), 0); // should not drop pings
     }
 
     #[test]
@@ -2067,6 +2250,7 @@ mod tests {
         let peer1_pubkey = NodeId::new(peer1.pubkey());
 
         let mut state = generate_test_state(peer0, vec![peer1]);
+        let original_name_record = generate_name_record(peer1, 0);
         state.outstanding_lookup_requests.insert(
             1,
             LookupInfo {
@@ -2111,6 +2295,11 @@ mod tests {
         assert!(cmds.is_empty());
 
         // insert into routing info after ping pong round trip
+        assert_eq!(
+            state.socket_to_id.get(&original_name_record.udp_address()),
+            Some(&peer1_pubkey)
+        );
+        assert!(!state.socket_to_id.contains_key(&record.udp_address()));
         state.handle_pong(
             peer1_pubkey,
             Pong {
@@ -2121,6 +2310,15 @@ mod tests {
         assert!(state.routing_info.contains_key(&peer1_pubkey));
         assert_eq!(state.routing_info.get(&peer1_pubkey).unwrap(), &record);
         assert!(!state.pending_queue.contains_key(&peer1_pubkey));
+        assert!(
+            !state
+                .socket_to_id
+                .contains_key(&original_name_record.udp_address())
+        );
+        assert_eq!(
+            state.socket_to_id.get(&record.udp_address()),
+            Some(&peer1_pubkey)
+        );
 
         // should not update name record if record has lower sequence number (seq num decremented to 1)
         let cmds = state
@@ -2461,6 +2659,134 @@ mod tests {
     }
 
     #[test]
+    fn test_multiple_node_ids_bind_to_same_ip() {
+        let keys = create_keys::<SignatureType>(3);
+        let peer0 = &keys[0];
+        let peer1 = &keys[1];
+        let peer2 = &keys[2];
+        let peer1_pubkey = NodeId::new(peer1.pubkey());
+        let peer2_pubkey = NodeId::new(peer2.pubkey());
+
+        let mut state = generate_test_state(peer0, vec![]);
+
+        // peer1 binds to DUMMY_ADDR
+        let cmds = state.handle_ping(
+            peer1_pubkey,
+            Ping {
+                id: 1,
+                local_name_record: generate_dummy_name_record(peer1),
+            },
+        );
+        let ping = extract_ping(cmds.clone());
+        assert_eq!(cmds.len(), 3); // PingTimeout timer, SendPing, Pong
+        assert!(state.pending_queue.contains_key(&peer1_pubkey));
+        assert!(state.socket_to_id.is_empty());
+
+        state.handle_pong(
+            peer1_pubkey,
+            Pong {
+                ping_id: ping[0].1.id,
+                local_record_seq: 0,
+            },
+        );
+        assert!(state.routing_info.contains_key(&peer1_pubkey));
+        assert_eq!(state.socket_to_id.get(&DUMMY_ADDR), Some(&peer1_pubkey));
+
+        // peer2 tries to bind to the same DUMMY_ADDR
+        let cmds = state.handle_ping(
+            peer2_pubkey,
+            Ping {
+                id: 2,
+                local_name_record: generate_dummy_name_record(peer2),
+            },
+        );
+        assert_eq!(cmds.len(), 0); // dropped due to address conflict with no pings and pongs sent
+        assert!(!state.pending_queue.contains_key(&peer2_pubkey));
+        assert_eq!(state.socket_to_id.get(&DUMMY_ADDR), Some(&peer1_pubkey));
+        assert_eq!(state.metrics[GAUGE_PEER_DISC_SOCKET_COLLISIONS], 1);
+    }
+
+    #[test]
+    fn test_socket_to_id_cleanup_on_non_participating_peer_removal() {
+        let keys = create_keys::<SignatureType>(2);
+        let peer0 = &keys[0];
+        let peer1 = &keys[1];
+        let peer1_pubkey = NodeId::new(peer1.pubkey());
+
+        let mut state = generate_test_state(peer0, vec![peer1]);
+
+        // verify peer1 is in routing_info and socket_to_id
+        let peer1_record = generate_name_record(peer1, 0);
+        assert!(state.routing_info.contains_key(&peer1_pubkey));
+        assert_eq!(
+            state.socket_to_id.get(&peer1_record.udp_address()),
+            Some(&peer1_pubkey)
+        );
+
+        // set up peer1 to be pruned as non-participating
+        // by advancing current_round beyond last_participation_prune_threshold
+        state.current_round = Round(6000); // last_participation_prune_threshold is 5000
+
+        // call refresh which should remove non-participating peers
+        state.refresh();
+
+        // verify peer1 is removed from routing_info
+        assert!(!state.routing_info.contains_key(&peer1_pubkey));
+        assert!(!state.participation_info.contains_key(&peer1_pubkey));
+
+        // verify socket_to_id is also cleaned up
+        assert!(!state.socket_to_id.contains_key(&peer1_record.udp_address()));
+    }
+
+    #[test]
+    fn test_socket_to_id_cleanup_on_excessive_peer_pruning() {
+        let keys = create_keys::<SignatureType>(6);
+        let peer0 = &keys[0];
+
+        // create 5 peers (exceeds max_num_peers)
+        let peer_keys = vec![&keys[1], &keys[2], &keys[3], &keys[4], &keys[5]];
+        let mut state = generate_test_state(peer0, peer_keys.clone());
+
+        // set max_num_peers to 3 to force pruning
+        state.max_num_peers = 3;
+
+        // collect initial socket addresses
+        let initial_sockets: Vec<_> = peer_keys
+            .iter()
+            .map(|key| {
+                let node_id = NodeId::new(key.pubkey());
+                let record = generate_name_record(*key, 0);
+                (node_id, record.udp_address())
+            })
+            .collect();
+
+        // verify all peers are initially in routing_info and socket_to_id
+        assert_eq!(state.routing_info.len(), 5);
+        for (node_id, socket) in &initial_sockets {
+            assert!(state.routing_info.contains_key(node_id));
+            assert_eq!(state.socket_to_id.get(socket), Some(node_id));
+        }
+
+        // call refresh which should prune excessive peers
+        state.refresh();
+
+        // verify peers were pruned down to max_num_peers
+        assert_eq!(state.routing_info.len(), 3);
+
+        // verify socket_to_id only contains entries for remaining peers
+        assert_eq!(state.socket_to_id.len(), 3);
+        for (node_id, socket) in &initial_sockets {
+            if state.routing_info.contains_key(node_id) {
+                // if peer is still in routing_info, should be in socket_to_id
+                assert_eq!(state.socket_to_id.get(socket), Some(node_id));
+            } else {
+                // if peer was pruned, should not be in socket_to_id
+                assert!(!state.socket_to_id.contains_key(socket));
+            }
+        }
+    }
+
+    #[test]
     fn test_publisher_participation_info() {
         let keys = create_keys::<SignatureType>(4);
         let peer0 = &keys[0];
@@ -2705,6 +3031,7 @@ mod tests {
             routing_info,
             participation_info: BTreeMap::new(),
             pending_queue,
+            socket_to_id: BTreeMap::new(),
             outstanding_lookup_requests: HashMap::new(),
             metrics: ExecutorMetrics::default(),
             refresh_period: Duration::from_secs(120),
@@ -2718,6 +3045,10 @@ mod tests {
             enable_client: false,
             rng: ChaCha8Rng::seed_from_u64(123456),
             persisted_peers_path: Default::default(),
+            ping_rate_limiter: governor::RateLimiter::direct(
+                governor::Quota::per_second(NonZeroU32::new(100).unwrap())
+                    .allow_burst(NonZeroU32::new(100).unwrap()),
+            ),
         };
 
         // set up a temporary file path for testing
@@ -2793,5 +3124,38 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&temp_file);
+    }
+
+    #[test]
+    fn test_drop_ping_with_mismatched_sender_node_id() {
+        let keys = create_keys::<SignatureType>(3);
+        let peer0 = &keys[0];
+        let peer1 = &keys[1];
+        let peer1_pubkey = NodeId::new(peer1.pubkey());
+        let peer2 = &keys[2];
+
+        let mut state = generate_test_state(peer0, vec![]);
+
+        // create a name record signed by peer2, but claim it's from peer1
+        let incorrect_name_record = generate_name_record(peer2, 0);
+
+        // send ping with from=peer1_pubkey but name record signed by peer2
+        let cmds = state.handle_ping(
+            peer1_pubkey,
+            Ping {
+                id: 123,
+                local_name_record: incorrect_name_record,
+            },
+        );
+
+        // ping should be dropped - no commands returned
+        assert!(
+            cmds.is_empty(),
+            "ping with mismatched sender node ID should be dropped"
+        );
+        assert!(
+            !state.pending_queue.contains_key(&peer1_pubkey),
+            "peer should not be added to pending queue"
+        );
     }
 }

@@ -29,7 +29,7 @@ use monad_eth_testutil::{generate_block_with_txs, make_legacy_tx, secret_to_eth_
 use monad_eth_txpool_executor::{
     forward::egress_max_size_bytes, EthTxPoolExecutor, EthTxPoolExecutorClient, EthTxPoolIpcConfig,
 };
-use monad_eth_txpool_ipc::EthTxPoolIpcClient;
+use monad_eth_txpool_ipc::{EthTxPoolIpcClient, EthTxPoolIpcTx};
 use monad_eth_txpool_types::EthTxPoolSnapshot;
 use monad_executor::Executor;
 use monad_executor_glue::{MempoolEvent, MonadEvent, TxPoolCommand};
@@ -102,50 +102,48 @@ async fn setup_txpool_executor_with_client() -> (
 async fn test_ipc_tx_forwarding_pacing() {
     let (mut txpool_executor, mut ipc_client) = setup_txpool_executor_with_client().await;
 
-    let mut cx = Context::from_waker(noop_waker_ref());
-
-    assert!(txpool_executor.poll_next_unpin(&mut cx).is_pending());
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), txpool_executor.next())
+            .await
+            .is_err()
+    );
 
     const NUM_TXS: usize = 1024;
 
-    for nonce in 0..NUM_TXS {
-        ipc_client
-            .feed(&make_legacy_tx(
-                S1,
-                MIN_BASE_FEE.into(),
-                30_000_000,
-                nonce as u64,
-                egress_max_size_bytes(
-                    MockChainConfig::DEFAULT
-                        .get_execution_chain_revision(0)
-                        .execution_chain_params(),
-                ) / 2
-                    - 256,
-            ))
-            .await
-            .unwrap();
-    }
+    let handle = tokio::task::spawn(async move {
+        for nonce in 0..NUM_TXS {
+            ipc_client
+                .feed(EthTxPoolIpcTx::new_with_default_priority(
+                    make_legacy_tx(
+                        S1,
+                        MIN_BASE_FEE.into(),
+                        30_000_000,
+                        nonce as u64,
+                        egress_max_size_bytes(
+                            MockChainConfig::DEFAULT
+                                .get_execution_chain_revision(0)
+                                .execution_chain_params(),
+                        ) / 2
+                            - 256,
+                    ),
+                    Vec::default(),
+                ))
+                .await
+                .unwrap();
+        }
 
-    ipc_client.flush().await.unwrap();
+        ipc_client.flush().await.unwrap();
+
+        ipc_client
+    });
 
     let mut forwarded_txs = 0;
 
     while forwarded_txs < NUM_TXS {
-        let event;
-        let mut retries = 0;
-
-        loop {
-            if let Poll::Ready(result) = txpool_executor.poll_next_unpin(&mut cx) {
-                event = result.unwrap();
-                break;
-            };
-            if retries > 10 {
-                panic!("max retries hit");
-            }
-
-            tokio::time::sleep(Duration::from_millis(10)).await;
-            retries += 1;
-        }
+        let event = tokio::time::timeout(Duration::from_secs(1), txpool_executor.next())
+            .await
+            .expect("TxpoolExecutor does not timeout")
+            .unwrap();
 
         match event {
             MonadEvent::MempoolEvent(mempool_event) => match mempool_event {
@@ -171,7 +169,70 @@ async fn test_ipc_tx_forwarding_pacing() {
 
     assert_eq!(forwarded_txs, NUM_TXS);
 
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), txpool_executor.next())
+            .await
+            .is_err()
+    );
+
+    let ipc_client = handle.await.unwrap();
+    drop(ipc_client);
+}
+
+#[tokio::test]
+async fn test_ipc_full() {
+    let (mut txpool_executor, mut ipc_client) = setup_txpool_executor_with_client().await;
+
+    let mut cx = Context::from_waker(noop_waker_ref());
 
     assert!(txpool_executor.poll_next_unpin(&mut cx).is_pending());
+
+    const TX_BYTES: usize = 256 * 1024;
+
+    let handle = tokio::task::spawn(async move {
+        for nonce in 0.. {
+            let tx = make_legacy_tx(S1, MIN_BASE_FEE.into(), 30_000_000, nonce as u64, TX_BYTES);
+
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(10),
+                ipc_client.send(EthTxPoolIpcTx::new_with_default_priority(tx, vec![])),
+            )
+            .await
+            {
+                Ok(Ok(())) => continue,
+                Err(_) => break,
+                Ok(Err(err)) => panic!("send failed: {err:#?}"),
+            }
+        }
+
+        ipc_client
+    });
+
+    // Wait for executor to process some events
+    tokio::time::sleep(std::time::Duration::from_millis(1_000)).await;
+
+    // IPC socket is full on send side
+    assert!(txpool_executor
+        .poll_next_unpin(&mut cx)
+        .map(|result| result.unwrap())
+        .is_ready());
+
+    while let Poll::Ready(result) = txpool_executor.poll_next_unpin(&mut cx) {
+        assert!(result.is_some());
+        tokio::task::yield_now().await;
+    }
+
+    let tx = make_legacy_tx(S1, MIN_BASE_FEE.into(), 30_000_000, 0, 0);
+
+    let mut ipc_client = handle.await.unwrap();
+
+    // IPC socket send succeeds
+
+    let () = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        ipc_client.send(EthTxPoolIpcTx::new_with_default_priority(tx, vec![])),
+    )
+    .await
+    .unwrap()
+    .unwrap();
 }

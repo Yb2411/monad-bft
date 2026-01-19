@@ -39,7 +39,10 @@ use monad_crypto::{certificate_signature::CertificateKeyPair, NopKeyPair, NopSig
 use monad_eth_block_policy::{EthBlockPolicy, EthValidatedBlock};
 use monad_eth_block_validator::EthBlockValidator;
 use monad_eth_testutil::{recover_tx, secret_to_eth_address, S1, S2};
-use monad_eth_txpool::{EthTxPool, EthTxPoolEventTracker, EthTxPoolMetrics};
+use monad_eth_txpool::{
+    EthTxPool, EthTxPoolConfig, EthTxPoolEventTracker, EthTxPoolMetrics, PoolTransactionKind,
+    TrackedTxLimitsConfig,
+};
 use monad_eth_types::{EthBlockBody, EthExecutionProtocol, EthHeader, ProposedEthHeader};
 use monad_state_backend::NopStateBackend;
 use monad_testutil::signing::MockSignatures;
@@ -406,18 +409,38 @@ fn test_multiple_non_emptying_different_blocks_sufficient() {
     test_runner(chain_config, block_policy, state_backend, txs, true);
 }
 
+#[test]
+fn test_invalid_delegation_non_emptying_sufficient() {
+    let (_round, _seq_num, block_policy, chain_config) = genesis_setup();
+    let (txs, state_backend) = invalid_delegation_non_emptying_sufficient_inputs();
+
+    test_runner(chain_config, block_policy, state_backend, txs, true);
+}
+
+#[test]
+fn test_invalid_delegation_non_emptying_insufficient() {
+    let (_round, _seq_num, block_policy, chain_config) = genesis_setup();
+    let (txs, state_backend) = invalid_delegation_non_emptying_insufficient_inputs();
+
+    test_runner(chain_config, block_policy, state_backend, txs, false);
+}
+
 fn create_test_txpool(chain_config: &MonadChainConfig) -> TestTxPool {
     TestTxPool::new(
-        None,                               // max_addresses
-        None,                               // max_txs
-        None,                               // max_eip2718_bytes
-        None,                               // soft_evict_addresses_watermark
-        std::time::Duration::from_secs(60), // soft_tx_expiry
-        std::time::Duration::from_secs(60), // hard_tx_expiry
+        EthTxPoolConfig {
+            limits: TrackedTxLimitsConfig::new(
+                None,
+                None,
+                None,
+                None,
+                std::time::Duration::from_secs(60),
+                std::time::Duration::from_secs(60),
+            ),
+            do_local_insert: true,
+        },
         chain_config.chain_id(),
         chain_config.get_chain_revision(GENESIS_ROUND),
         chain_config.get_execution_chain_revision(0), // genesis timestamp
-        true,                                         // do_local_insert
     )
 }
 
@@ -460,8 +483,10 @@ fn check_txpool_coherency(
             &block_policy,
             state_backend,
             chain_config,
-            block_txs,
-            false,
+            block_txs
+                .into_iter()
+                .map(|tx| (tx, PoolTransactionKind::Forwarded))
+                .collect(),
             |_tx| {},
         );
     }
@@ -2163,6 +2188,104 @@ fn emptying_delegation_sufficient_inputs() -> (
         (GENESIS_SEQ_NUM + SeqNum(1), vec![]),
         (GENESIS_SEQ_NUM + SeqNum(3), vec![]),
         (GENESIS_SEQ_NUM + SeqNum(5), vec![tx1, tx2]),
+    ]);
+
+    let state_backend = NopStateBackend {
+        balances: BTreeMap::from([
+            (sender, U256::from(15 * ONE_ETHER)),
+            (bundler, U256::from(ONE_ETHER)),
+        ]),
+        ..Default::default()
+    };
+
+    (txs, state_backend)
+}
+
+// 41
+fn invalid_delegation_non_emptying_sufficient_inputs() -> (
+    BTreeMap<SeqNum, Vec<Recovered<TxEnvelope>>>,
+    NopStateBackend,
+) {
+    let signer = S1;
+
+    // Invalid delegation with wrong chain id
+    let invalid_auth = Authorization {
+        chain_id: MONAD_DEVNET_CHAIN_ID + 999,
+        address: Address::default(),
+        nonce: 0,
+    };
+    let signed_invalid_auth = sign_authorization(signer, invalid_auth);
+    let tx0 = make_eip7702_tx_with_value(
+        S2,
+        0,
+        100_000_000_000,
+        0,
+        50_000,
+        0,
+        vec![signed_invalid_auth],
+        0,
+    );
+    let bundler = tx0.signer();
+
+    let max_fee_per_gas = (5 * ONE_ETHER) / 50_000;
+    let tx1 = make_test_tx(signer, 50_000, max_fee_per_gas, 1 * ONE_ETHER, 1);
+    let sender = tx1.signer();
+    let tx2 = make_test_tx(signer, 50_000, max_fee_per_gas, 0, 2);
+
+    let txs = BTreeMap::from([
+        (GENESIS_SEQ_NUM + SeqNum(1), vec![tx0]),
+        (GENESIS_SEQ_NUM + SeqNum(3), vec![tx1]),
+        (GENESIS_SEQ_NUM + SeqNum(5), vec![tx2]),
+    ]);
+
+    let state_backend = NopStateBackend {
+        balances: BTreeMap::from([
+            (sender, U256::from(10 * ONE_ETHER)),
+            (bundler, U256::from(ONE_ETHER)),
+        ]),
+        ..Default::default()
+    };
+
+    (txs, state_backend)
+}
+
+// 42
+fn invalid_delegation_non_emptying_insufficient_inputs() -> (
+    BTreeMap<SeqNum, Vec<Recovered<TxEnvelope>>>,
+    NopStateBackend,
+) {
+    let signer = S1;
+
+    // Invalid delegation with wrong chain id
+    let invalid_auth = Authorization {
+        chain_id: MONAD_DEVNET_CHAIN_ID + 999,
+        address: Address::default(),
+        nonce: 0,
+    };
+    let signed_invalid_auth = sign_authorization(signer, invalid_auth);
+    let tx0 = make_eip7702_tx_with_value(
+        S2,
+        0,
+        100_000_000_000,
+        0,
+        50_000,
+        0,
+        vec![signed_invalid_auth],
+        0,
+    );
+    let bundler = tx0.signer();
+
+    let max_fee_per_gas = (5 * ONE_ETHER) / 50_000;
+    let tx1 = make_test_tx(signer, 50_000, max_fee_per_gas, 0, 1);
+    let sender = tx1.signer();
+
+    let max_fee_per_gas = (6 * ONE_ETHER) / 50_000;
+    let tx2 = make_test_tx(signer, 50_000, max_fee_per_gas, 0, 2);
+
+    let txs = BTreeMap::from([
+        (GENESIS_SEQ_NUM + SeqNum(1), vec![tx0]),
+        (GENESIS_SEQ_NUM + SeqNum(3), vec![tx1]),
+        (GENESIS_SEQ_NUM + SeqNum(5), vec![tx2]),
     ]);
 
     let state_backend = NopStateBackend {

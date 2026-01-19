@@ -26,7 +26,7 @@ use tracing::{debug, error, warn};
 
 use super::{
     super::{config::RaptorCastConfigSecondaryClient, util::Group},
-    group_message::{ConfirmGroup, FullNodesGroupMessage, PrepareGroup, PrepareGroupResponse},
+    group_message::{ConfirmGroup, PrepareGroup, PrepareGroupResponse},
 };
 
 /// Metrics constant
@@ -36,7 +36,7 @@ pub const CLIENT_RECEIVED_INVITES: &str = "monad.bft.raptorcast.secondary.client
 pub const CLIENT_RECEIVED_CONFIRMS: &str =
     "monad.bft.raptorcast.secondary.client.received_confirms";
 
-type GroupAsClient<ST> = Group<ST>;
+type GroupAsClient<PT> = Group<PT>;
 
 // This is for when the router is playing the role of a client
 // That is, we are a full-node receiving group invites from a validator
@@ -53,16 +53,21 @@ where
     // [start_round, end_round) -> GroupAsClient
     // Represents all raptorcast groups that we have accepted and haven't expired
     // yet. The groups may overlap.
-    confirmed_groups: IntervalMap<Round, GroupAsClient<ST>>,
+    confirmed_groups: IntervalMap<Round, GroupAsClient<CertificateSignaturePubKey<ST>>>,
 
     // start_round -> validator_id -> group invite
     // Once we receive an invite, we remember how the invite looked like, so
     // that we don't blindly accept any confirmation message.
-    pending_confirms:
-        BTreeMap<Round, BTreeMap<NodeId<CertificateSignaturePubKey<ST>>, PrepareGroup<ST>>>,
+    pending_confirms: BTreeMap<
+        Round,
+        BTreeMap<
+            NodeId<CertificateSignaturePubKey<ST>>,
+            PrepareGroup<CertificateSignaturePubKey<ST>>,
+        >,
+    >,
 
     // Once a group is confirmed, it is sent to this channel
-    group_sink_channel: UnboundedSender<GroupAsClient<ST>>,
+    group_sink_channel: UnboundedSender<GroupAsClient<CertificateSignaturePubKey<ST>>>,
 
     // For avoiding accepting invites/confirms for rounds we've already started
     curr_round: Round,
@@ -82,7 +87,7 @@ where
 {
     pub fn new(
         client_node_id: NodeId<CertificateSignaturePubKey<ST>>,
-        group_sink_channel: UnboundedSender<GroupAsClient<ST>>,
+        group_sink_channel: UnboundedSender<GroupAsClient<CertificateSignaturePubKey<ST>>>,
         config: RaptorCastConfigSecondaryClient,
     ) -> Self {
         assert!(
@@ -147,7 +152,10 @@ where
         Instant::now() < self.last_round_heartbeat + self.config.invite_accept_heartbeat
     }
 
-    fn validate_prepare_group_message(&self, invite_msg: &PrepareGroup<ST>) -> bool {
+    fn validate_prepare_group_message(
+        &self,
+        invite_msg: &PrepareGroup<CertificateSignaturePubKey<ST>>,
+    ) -> bool {
         // Sanity check the message
         if invite_msg.start_round >= invite_msg.end_round {
             warn!(
@@ -255,10 +263,10 @@ where
         true
     }
 
-    fn handle_prepare_group_message(
+    pub fn handle_prepare_group_message(
         &mut self,
-        invite_msg: PrepareGroup<ST>,
-    ) -> PrepareGroupResponse<ST> {
+        invite_msg: PrepareGroup<CertificateSignaturePubKey<ST>>,
+    ) -> PrepareGroupResponse<CertificateSignaturePubKey<ST>> {
         debug!(
             ?invite_msg,
             "RaptorCastSecondary Client received group invite"
@@ -284,7 +292,7 @@ where
         }
     }
 
-    fn handle_confirm_group_message(&mut self, confirm_msg: ConfirmGroup<ST>) {
+    pub fn handle_confirm_group_message(&mut self, confirm_msg: ConfirmGroup<ST>) -> bool {
         let start_round = &confirm_msg.prepare.start_round;
 
         // Drop the message if the round span is invalid
@@ -296,7 +304,7 @@ where
                 "RaptorCastSecondary ignoring invalid round span, confirm = {:?}",
                 confirm_msg
             );
-            return;
+            return false;
         };
 
         // Drop the group if we've already entered the round
@@ -306,7 +314,7 @@ where
                         {:?}, confirm = {:?}",
                 self.curr_round, confirm_msg
             );
-            return;
+            return false;
         }
 
         let Some(invites) = self.pending_confirms.get_mut(start_round) else {
@@ -315,7 +323,7 @@ where
                         for unrecognized start round: {:?}",
                 confirm_msg
             );
-            return;
+            return false;
         };
 
         let maybe_entry = invites.get(&confirm_msg.prepare.validator_id);
@@ -325,7 +333,7 @@ where
                             unrecognized validator id: {:?}",
                 confirm_msg
             );
-            return;
+            return false;
         };
 
         if old_invite != &confirm_msg.prepare {
@@ -334,7 +342,7 @@ where
                                 doesn't match the original invite. Expected: {:?}, got: {:?}",
                 old_invite, confirm_msg.prepare
             );
-            return;
+            return false;
         }
 
         let confirm_group_size = confirm_msg.peers.len();
@@ -347,7 +355,7 @@ where
                 confirm_msg.prepare.max_group_size,
                 confirm_msg
             );
-            return;
+            return false;
         }
 
         if !confirm_msg.peers.contains(&self.client_node_id) {
@@ -356,7 +364,7 @@ where
                                 with a group that does not contain our node_id: {:?}",
                 confirm_msg
             );
-            return;
+            return false;
         }
 
         let group = GroupAsClient::new_fullnode_group(
@@ -394,6 +402,8 @@ where
         invites.remove(&confirm_msg.prepare.validator_id);
 
         self.metrics[CLIENT_NUM_CURRENT_GROUPS] = self.get_current_group_count();
+
+        true
     }
 
     fn get_current_group_count(&self) -> u64 {
@@ -402,38 +412,11 @@ where
             .count() as u64
     }
 
-    // Called when group invite or group confirmation is received from validator
-    pub fn on_receive_group_message(
-        &mut self,
-        msg: FullNodesGroupMessage<ST>,
-    ) -> Option<(
-        FullNodesGroupMessage<ST>,
-        NodeId<CertificateSignaturePubKey<ST>>,
-    )> {
-        match msg {
-            FullNodesGroupMessage::PrepareGroup(invite_msg) => {
-                let dest_node_id = invite_msg.validator_id;
-                let resp = self.handle_prepare_group_message(invite_msg);
-                Some((
-                    FullNodesGroupMessage::PrepareGroupResponse(resp),
-                    dest_node_id,
-                ))
-            }
-            FullNodesGroupMessage::ConfirmGroup(confirm_msg) => {
-                self.handle_confirm_group_message(confirm_msg);
-                None
-            }
-            FullNodesGroupMessage::PrepareGroupResponse(_) => {
-                error!(
-                    "RaptorCastSecondary client received a \
-                                PrepareGroupResponse message"
-                );
-                None
-            }
-        }
-    }
-
-    fn overlaps(begin: Round, end: Round, group: &PrepareGroup<ST>) -> bool {
+    fn overlaps(
+        begin: Round,
+        end: Round,
+        group: &PrepareGroup<CertificateSignaturePubKey<ST>>,
+    ) -> bool {
         assert!(begin <= end);
         assert!(group.start_round <= group.end_round);
         group.start_round < end && group.end_round > begin
@@ -477,11 +460,14 @@ mod tests {
 
     type ST = SecpSignature;
     type PubKeyType = CertificateSignaturePubKey<ST>;
-    type RcToRcChannelGrp<ST> = (UnboundedSender<Group<ST>>, UnboundedReceiver<Group<ST>>);
+    type RcToRcChannelGrp = (
+        UnboundedSender<Group<PubKeyType>>,
+        UnboundedReceiver<Group<PubKeyType>>,
+    );
 
     #[test]
     fn malformed_prepare_messages() {
-        let (clt_tx, _clt_rx): RcToRcChannelGrp<ST> = unbounded_channel();
+        let (clt_tx, _clt_rx): RcToRcChannelGrp = unbounded_channel();
         let self_id = nid(1);
         let mut clt = Client::<ST>::new(
             self_id,
@@ -531,7 +517,7 @@ mod tests {
 
     #[test]
     fn exceed_max_num_group() {
-        let (clt_tx, _clt_rx): RcToRcChannelGrp<ST> = unbounded_channel();
+        let (clt_tx, _clt_rx): RcToRcChannelGrp = unbounded_channel();
         let self_id = nid(1);
         let mut clt = Client::<ST>::new(
             self_id,
@@ -580,7 +566,7 @@ mod tests {
 
     #[test]
     fn test_get_current_group_count() {
-        let (clt_tx, _clt_rx): RcToRcChannelGrp<ST> = unbounded_channel();
+        let (clt_tx, _clt_rx): RcToRcChannelGrp = unbounded_channel();
         let self_id = nid(1);
         let mut clt = Client::<ST>::new(
             self_id,
