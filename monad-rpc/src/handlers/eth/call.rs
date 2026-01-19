@@ -45,7 +45,7 @@ use super::{
     gas::{estimate_gas, suggested_priority_fee, GasEstimator},
 };
 use crate::{
-    chainstate::get_block_key_from_tag,
+    chainstate::{get_block_key_from_tag, ChainState},
     eth_json_types::{BlockTagOrHash, BlockTags, FillTransactionResult, Quantity, UnformattedData},
     handlers::debug::{decode_call_frame, Tracer, TracerObject},
     hex,
@@ -1017,7 +1017,7 @@ pub struct MonadEthFillTransactionParams {
 )]
 #[allow(non_snake_case)]
 pub async fn monad_eth_fillTransaction<T: Triedb>(
-    triedb_env: &T,
+    chain_state: &ChainState<T>,
     eth_call_executor: Arc<EthCallExecutor>,
     chain_id: u64,
     provider_gas_limit: u64,
@@ -1045,22 +1045,24 @@ pub async fn monad_eth_fillTransaction<T: Triedb>(
 
     tx.chain_id = Some(U64::from(chain_id));
 
-    let block_key = get_block_key_from_tag(triedb_env, BlockTags::Latest)
+    // Get header from chain_state (uses buffer cache if available)
+    let header = chain_state
+        .get_block_header(BlockTagOrHash::BlockTags(BlockTags::Latest))
+        .await
+        .map_err(|_| JsonRpcError::block_not_found())?;
+
+    // Get block_key for account lookup and gas estimation (no cache for accounts)
+    let block_key = get_block_key_from_tag(&chain_state.triedb_env, BlockTags::Latest)
         .ok_or(JsonRpcError::block_not_found())?;
 
     if tx.nonce.is_none() {
-        let account = triedb_env
+        let account = chain_state
+            .triedb_env
             .get_account(block_key, from.into())
             .await
             .map_err(JsonRpcError::internal_error)?;
         tx.nonce = Some(U64::from(account.nonce));
     }
-
-    let header = triedb_env
-        .get_block_header(block_key)
-        .await
-        .map_err(JsonRpcError::internal_error)?
-        .ok_or_else(JsonRpcError::block_not_found)?;
 
     // Fill max_priority_fee_per_gas with suggested fee if not specified (EIP-1559 only)
     if let GasPriceDetails::Eip1559 {
@@ -1076,13 +1078,13 @@ pub async fn monad_eth_fillTransaction<T: Triedb>(
     }
 
     // Fill gas prices (max_fee_per_gas, max_priority_fee_per_gas, or gas_price)
-    let base_fee = U256::from(header.header.base_fee_per_gas.unwrap_or_default());
+    let base_fee = U256::from(header.base_fee_per_gas.unwrap_or_default());
     tx.fill_gas_prices(base_fee)?;
 
     // Estimate gas if not specified
     let gas_specified = tx.gas.is_some();
     if !gas_specified {
-        let protocol_gas_limit = header.header.gas_limit;
+        let protocol_gas_limit = header.gas_limit;
         let eth_call_provider_gas_limit = provider_gas_limit.min(protocol_gas_limit);
         let original_tx_gas = U256::from(protocol_gas_limit);
 
@@ -1091,7 +1093,7 @@ pub async fn monad_eth_fillTransaction<T: Triedb>(
 
         let gas_estimator = GasEstimator::new(
             chain_id,
-            header.header.clone(),
+            header.clone(),
             from,
             block_key,
             StateOverrideSet::default(),

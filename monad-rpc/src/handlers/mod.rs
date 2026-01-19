@@ -458,7 +458,7 @@ async fn eth_fillTransaction(
     app_state: &MonadRpcResources,
     params: RequestParams<'_>,
 ) -> Result<Box<RawValue>, JsonRpcError> {
-    let triedb_env = app_state.triedb_reader.as_ref().method_not_supported()?;
+    let chain_state = app_state.chain_state.as_ref().method_not_supported()?;
 
     let Some(ref eth_call_executor) = app_state.eth_call_executor else {
         return Err(JsonRpcError::method_not_supported());
@@ -466,7 +466,7 @@ async fn eth_fillTransaction(
 
     let params = serde_json::from_str(params.get()).invalid_params()?;
     monad_eth_fillTransaction(
-        triedb_env,
+        chain_state,
         eth_call_executor.clone(),
         app_state.chain_id,
         app_state.eth_estimate_gas_provider_gas_limit,
