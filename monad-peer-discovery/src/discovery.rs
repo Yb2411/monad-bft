@@ -3158,4 +3158,153 @@ mod tests {
             "peer should not be added to pending queue"
         );
     }
+
+    #[test]
+    fn test_validator_recovery_via_lookup_after_ip_hijack() {
+        // Test scenario:
+        // 1. Attacker claims validator's IP via ping/pong
+        // 2. Refresh detects missing validator, sends lookup
+        // 3. Lookup response returns validator's name record
+        // 4. Validator responds to ping
+        // 5. Validator overwrites attacker's socket binding
+
+        let keys = create_keys::<SignatureType>(4);
+        let self_key = &keys[0];
+        let validator_key = &keys[1];
+        let attacker_key = &keys[2];
+        let other_peer_key = &keys[3];
+
+        let validator_id = NodeId::new(validator_key.pubkey());
+        let attacker_id = NodeId::new(attacker_key.pubkey());
+        let other_peer_id = NodeId::new(other_peer_key.pubkey());
+
+        // Create state with other_peer in routing_info (to answer lookups)
+        // but validator NOT in routing_info (simulating recovery scenario)
+        let mut state = generate_test_state(self_key, vec![other_peer_key]);
+
+        // Set up validator in epoch_validators so it's recognized as a validator
+        state
+            .epoch_validators
+            .insert(Epoch(1), BTreeSet::from([validator_id]));
+        state.self_role = PeerDiscoveryRole::ValidatorNone;
+
+        // Create validator's name record with DUMMY_ADDR
+        let validator_record = generate_dummy_name_record(validator_key);
+
+        // Step 1: Attacker claims DUMMY_ADDR via ping/pong
+        let attacker_record = generate_dummy_name_record(attacker_key);
+        let cmds = state.handle_ping(
+            attacker_id,
+            Ping {
+                id: 1,
+                local_name_record: attacker_record.clone(),
+            },
+        );
+        let ping = extract_ping(cmds);
+        assert!(state.pending_queue.contains_key(&attacker_id));
+
+        // Attacker responds with pong - gets promoted to routing_info
+        state.handle_pong(
+            attacker_id,
+            Pong {
+                ping_id: ping[0].1.id,
+                local_record_seq: 0,
+            },
+        );
+
+        // Verify attacker now owns DUMMY_ADDR
+        assert!(state.routing_info.contains_key(&attacker_id));
+        assert_eq!(state.socket_to_id.get(&DUMMY_ADDR), Some(&attacker_id));
+        assert!(!state.routing_info.contains_key(&validator_id));
+
+        // Step 2: Validator tries to ping directly - should be blocked by socket collision
+        let cmds = state.handle_ping(
+            validator_id,
+            Ping {
+                id: 2,
+                local_name_record: validator_record.clone(),
+            },
+        );
+        assert!(
+            cmds.is_empty(),
+            "validator's direct ping should be blocked due to socket collision"
+        );
+        assert!(!state.pending_queue.contains_key(&validator_id));
+        assert_eq!(
+            state.socket_to_id.get(&DUMMY_ADDR),
+            Some(&attacker_id),
+            "attacker should still own the socket"
+        );
+
+        // Step 3: Refresh should detect validator as missing and send lookup requests
+        let cmds = state.refresh();
+        let lookup_requests = extract_lookup_requests(cmds);
+        assert!(
+            !lookup_requests.is_empty(),
+            "refresh should send lookup requests for missing validator"
+        );
+
+        // Find lookup request targeting the validator
+        let validator_lookup = lookup_requests
+            .iter()
+            .find(|req| req.target == validator_id);
+        assert!(
+            validator_lookup.is_some(),
+            "should have lookup request for missing validator"
+        );
+        let lookup_id = validator_lookup.unwrap().lookup_id;
+
+        // Step 4: Simulate lookup response with validator's name record
+        // (as if other_peer returned it)
+        let cmds = state.handle_peer_lookup_response(
+            other_peer_id,
+            PeerLookupResponse {
+                lookup_id,
+                target: validator_id,
+                name_records: vec![validator_record.clone()],
+            },
+        );
+
+        // Validator should be inserted to pending_queue (no socket_to_id check!)
+        assert!(
+            state.pending_queue.contains_key(&validator_id),
+            "validator should be in pending_queue after lookup response"
+        );
+
+        // Extract the ping that was sent to validator
+        let pings = extract_ping(cmds);
+        assert!(!pings.is_empty(), "should send ping to validator");
+        let validator_ping_id = pings
+            .iter()
+            .find(|(target, _)| *target == validator_id)
+            .unwrap()
+            .1
+            .id;
+
+        // Step 5: Validator responds with pong - should overwrite attacker's socket
+        state.handle_pong(
+            validator_id,
+            Pong {
+                ping_id: validator_ping_id,
+                local_record_seq: 0,
+            },
+        );
+
+        // Verify validator now owns DUMMY_ADDR, overwriting attacker
+        assert!(
+            state.routing_info.contains_key(&validator_id),
+            "validator should be in routing_info"
+        );
+        assert_eq!(
+            state.socket_to_id.get(&DUMMY_ADDR),
+            Some(&validator_id),
+            "validator should have overwritten attacker's socket binding"
+        );
+
+        // Attacker is still in routing_info but no longer owns the socket
+        assert!(
+            state.routing_info.contains_key(&attacker_id),
+            "attacker still in routing_info"
+        );
+    }
 }
