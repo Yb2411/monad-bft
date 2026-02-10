@@ -29,7 +29,7 @@ use monad_crypto::certificate_signature::{
     CertificateSignaturePubKey, CertificateSignatureRecoverable, PubKey,
 };
 use monad_executor::Executor;
-use monad_executor_glue::{Message, RouterCommand};
+use monad_executor_glue::{Message, OutboundForwardTxs, RouterCommand};
 use monad_peer_discovery::{MonadNameRecord, NameRecord};
 use monad_raptorcast::{create_dataplane_for_tests, DataplaneHandles, RaptorCastEvent};
 use monad_secp::{KeyPair, SecpSignature};
@@ -95,6 +95,12 @@ impl Deserializable<Bytes> for MockMessage {
     }
 }
 
+impl OutboundForwardTxs for MockMessage {
+    fn forward_txs(_txs: Vec<Bytes>) -> Self {
+        MockMessage::new(0, 0)
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct MockEvent<P: PubKey>((NodeId<P>, u32));
 
@@ -108,6 +114,8 @@ where
             RaptorCastEvent::Message(event) => event,
             RaptorCastEvent::PeerManagerResponse(_) => unimplemented!(),
             RaptorCastEvent::SecondaryRaptorcastPeersUpdate { .. } => unimplemented!(),
+            RaptorCastEvent::LeanUdpTx { .. } => unimplemented!(),
+            RaptorCastEvent::LeanUdpForwardTxs { .. } => unimplemented!(),
         }
     }
 }
