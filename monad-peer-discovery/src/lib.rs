@@ -47,6 +47,7 @@ pub enum PortTag {
     TCP = 0,
     UDP = 1,
     AuthenticatedUDP = 2,
+    AuthTxIngestion = 3,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, RlpEncodable, RlpDecodable)]
@@ -68,6 +69,7 @@ impl Port {
             0 => Some(PortTag::TCP),
             1 => Some(PortTag::UDP),
             2 => Some(PortTag::AuthenticatedUDP),
+            3 => Some(PortTag::AuthTxIngestion),
             _ => None,
         }
     }
@@ -186,6 +188,10 @@ impl<const N: usize> PortList<N> {
 
     fn authenticated_udp_port(&self) -> Option<u16> {
         self.port_by_tag(PortTag::AuthenticatedUDP)
+    }
+
+    fn auth_tx_ingestion_port(&self) -> Option<u16> {
+        self.port_by_tag(PortTag::AuthTxIngestion)
     }
 }
 
@@ -330,6 +336,30 @@ impl NameRecord {
         }
     }
 
+    pub fn new_with_lean_udp_p2p(
+        ip: Ipv4Addr,
+        tcp_port: u16,
+        udp_port: u16,
+        authenticated_udp_port: u16,
+        auth_tx_ingestion_port: u16,
+        seq: u64,
+    ) -> Self {
+        let mut ports_vec = ArrayVec::new();
+        ports_vec.push(Port::new(PortTag::TCP, tcp_port));
+        ports_vec.push(Port::new(PortTag::UDP, udp_port));
+        ports_vec.push(Port::new(PortTag::AuthenticatedUDP, authenticated_udp_port));
+        ports_vec.push(Port::new(PortTag::AuthTxIngestion, auth_tx_ingestion_port));
+        let wire = WireNameRecordV2 {
+            ip,
+            ports: PortList(ports_vec),
+            capabilities: 0,
+            seq,
+        };
+        Self {
+            record: VersionedNameRecord::V2(wire),
+        }
+    }
+
     pub fn ip(&self) -> Ipv4Addr {
         match &self.record {
             VersionedNameRecord::V1(v1) => v1.ip,
@@ -386,6 +416,18 @@ impl NameRecord {
 
     pub fn authenticated_udp_socket(&self) -> Option<SocketAddrV4> {
         self.authenticated_udp_port()
+            .map(|port| SocketAddrV4::new(self.ip(), port))
+    }
+
+    pub fn auth_tx_ingestion_port(&self) -> Option<u16> {
+        match &self.record {
+            VersionedNameRecord::V1(_) => None,
+            VersionedNameRecord::V2(v2) => v2.ports.auth_tx_ingestion_port(),
+        }
+    }
+
+    pub fn lean_udp_p2p_socket(&self) -> Option<SocketAddrV4> {
+        self.auth_tx_ingestion_port()
             .map(|port| SocketAddrV4::new(self.ip(), port))
     }
 
@@ -461,6 +503,10 @@ impl<ST: CertificateSignatureRecoverable> MonadNameRecord<ST> {
         self.name_record.authenticated_udp_socket()
     }
 
+    pub fn lean_udp_p2p_address(&self) -> Option<SocketAddrV4> {
+        self.name_record.lean_udp_p2p_socket()
+    }
+
     pub fn seq(&self) -> u64 {
         self.name_record.seq()
     }
@@ -480,15 +526,23 @@ impl<ST: CertificateSignatureRecoverable> TryFrom<&PeerEntry<ST>> for MonadNameR
     type Error = <ST as CertificateSignature>::Error;
 
     fn try_from(peer: &PeerEntry<ST>) -> Result<Self, Self::Error> {
-        let name_record = match peer.auth_port {
-            Some(auth_port) => NameRecord::new_with_authentication(
+        let name_record = match (peer.auth_port, peer.auth_tx_ingestion_port) {
+            (Some(auth_port), Some(auth_tx_ingestion_port)) => NameRecord::new_with_lean_udp_p2p(
+                *peer.addr.ip(),
+                peer.addr.port(),
+                peer.addr.port(),
+                auth_port,
+                auth_tx_ingestion_port,
+                peer.record_seq_num,
+            ),
+            (Some(auth_port), None) => NameRecord::new_with_authentication(
                 *peer.addr.ip(),
                 peer.addr.port(),
                 peer.addr.port(),
                 auth_port,
                 peer.record_seq_num,
             ),
-            None => NameRecord::new(*peer.addr.ip(), peer.addr.port(), peer.record_seq_num),
+            _ => NameRecord::new(*peer.addr.ip(), peer.addr.port(), peer.record_seq_num),
         };
 
         let mut encoded = Vec::new();
@@ -515,6 +569,7 @@ impl<ST: CertificateSignatureRecoverable> TryFrom<&MonadNameRecord<ST>> for Peer
             signature: record.signature,
             record_seq_num: record.name_record.seq(),
             auth_port: record.name_record.authenticated_udp_port(),
+            auth_tx_ingestion_port: record.name_record.auth_tx_ingestion_port(),
         })
     }
 }
@@ -532,6 +587,10 @@ impl<ST: CertificateSignatureRecoverable> From<MonadNameRecordWithPubkey<'_, ST>
                 .record
                 .name_record
                 .authenticated_udp_port(),
+            auth_tx_ingestion_port: record_with_pubkey
+                .record
+                .name_record
+                .auth_tx_ingestion_port(),
         }
     }
 }
@@ -552,15 +611,23 @@ impl<ST: CertificateSignatureRecoverable> TryFrom<&NodeBootstrapPeerConfig<ST>>
             .address
             .parse::<SocketAddrV4>()
             .map_err(|_| PeerConfigConversionError::InvalidAddress(peer_config.address.clone()))?;
-        let name_record = match peer_config.auth_port {
-            Some(auth_port) => NameRecord::new_with_authentication(
+        let name_record = match (peer_config.auth_port, peer_config.auth_tx_ingestion_port) {
+            (Some(auth_port), Some(auth_tx_ingestion_port)) => NameRecord::new_with_lean_udp_p2p(
+                *addr.ip(),
+                addr.port(),
+                addr.port(),
+                auth_port,
+                auth_tx_ingestion_port,
+                peer_config.record_seq_num,
+            ),
+            (Some(auth_port), None) => NameRecord::new_with_authentication(
                 *addr.ip(),
                 addr.port(),
                 addr.port(),
                 auth_port,
                 peer_config.record_seq_num,
             ),
-            None => NameRecord::new(*addr.ip(), addr.port(), peer_config.record_seq_num),
+            _ => NameRecord::new(*addr.ip(), addr.port(), peer_config.record_seq_num),
         };
 
         let mut encoded = Vec::new();
@@ -595,6 +662,10 @@ impl<ST: CertificateSignatureRecoverable> From<MonadNameRecordWithPubkey<'_, ST>
                 .record
                 .name_record
                 .authenticated_udp_port(),
+            auth_tx_ingestion_port: record_with_pubkey
+                .record
+                .name_record
+                .auth_tx_ingestion_port(),
         }
     }
 }
@@ -1160,6 +1231,7 @@ mod tests {
             signature: wrong_signature,
             record_seq_num: seq,
             auth_port: None,
+            auth_tx_ingestion_port: None,
         };
 
         let result = MonadNameRecord::<SecpSignature>::try_from(&peer_entry);
