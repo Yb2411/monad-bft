@@ -21,6 +21,7 @@ use std::{
 use alloy_consensus::{Header as RlpHeader, Transaction as _};
 use alloy_eips::BlockNumberOrTag;
 use alloy_primitives::{Bloom, FixedBytes, U256};
+use alloy_rlp::Encodable;
 use alloy_rpc_types::{
     Block, BlockTransactions, Filter, FilterBlockOption, FilteredParams, Header, Log, Transaction,
     TransactionReceipt,
@@ -28,7 +29,7 @@ use alloy_rpc_types::{
 use futures::{stream, Stream, StreamExt, TryStreamExt};
 use itertools::Either;
 use monad_archive::{
-    model::BlockDataReader,
+    model::{BlockDataReader, TxIndexedData},
     prelude::{ArchiveReader, Context, ContextCompat, IndexReader, TxEnvelopeWithSender},
 };
 use monad_triedb_utils::triedb_env::{
@@ -136,19 +137,23 @@ impl<T: Triedb> ChainState<T> {
 
         // try archive if transaction hash not found and archive reader specified
         if let Some(archive_reader) = &self.archive_reader {
-            if let Some(tx_data) = archive_reader.get_tx_indexed_data(&hash.into()).await? {
-                let receipt = crate::handlers::eth::txn::parse_tx_receipt(
-                    tx_data.header_subset.base_fee_per_gas,
-                    Some(tx_data.header_subset.block_timestamp),
-                    tx_data.header_subset.block_hash,
-                    tx_data.tx,
-                    tx_data.header_subset.gas_used,
-                    tx_data.receipt,
-                    tx_data.header_subset.block_number,
-                    tx_data.header_subset.tx_index,
-                );
-
-                return Ok(receipt);
+            if let Some(TxIndexedData {
+                tx,
+                trace: _,
+                receipt,
+                header_subset,
+            }) = archive_reader.get_tx_indexed_data(&hash.into()).await?
+            {
+                return Ok(parse_tx_receipt(
+                    header_subset.block_hash,
+                    header_subset.block_number,
+                    Some(header_subset.block_timestamp),
+                    header_subset.base_fee_per_gas,
+                    header_subset.tx_index,
+                    tx,
+                    receipt,
+                    header_subset.gas_used,
+                ));
             }
         }
 
@@ -830,6 +835,7 @@ async fn try_collect_logs_stream_with_heuristic_response_limit<E>(
 
     let num_blocks_total = to_block + 1 - from_block;
 
+    let mut last_block_number_processed = None;
     let mut num_blocks_processed = 0u64;
     let mut heuristic_response_size = 0u64;
 
@@ -839,14 +845,21 @@ async fn try_collect_logs_stream_with_heuristic_response_limit<E>(
         match result {
             Err(err) => return Ok(Err(err)),
             Ok((block_number, logs)) => {
-                if block_number != from_block.saturating_add(num_blocks_processed) {
-                    error!(
-                        ?from_block,
-                        ?num_blocks_processed,
-                        ?block_number,
-                        "logs stream block numbers inconsistent"
-                    );
-                    return Err(JsonRpcError::internal_error(format!("Logs out of order")));
+                if let Some(last_block_number_processed) =
+                    last_block_number_processed.replace(block_number)
+                {
+                    if block_number <= last_block_number_processed {
+                        error!(
+                            ?from_block,
+                            ?num_blocks_processed,
+                            ?last_block_number_processed,
+                            ?block_number,
+                            "logs stream block numbers inconsistent"
+                        );
+                        return Err(JsonRpcError::internal_error(
+                            "Logs out of order".to_string(),
+                        ));
+                    }
                 }
 
                 num_blocks_processed += 1;
@@ -859,7 +872,9 @@ async fn try_collect_logs_stream_with_heuristic_response_limit<E>(
                         ?num_blocks_total,
                         "logs stream block number exceeded range"
                     );
-                    return Err(JsonRpcError::internal_error(format!("Logs out of range")));
+                    return Err(JsonRpcError::internal_error(
+                        "Logs out of range".to_string(),
+                    ));
                 }
 
                 response_logs.extend(logs.into_iter().map(|log| {
@@ -1044,21 +1059,28 @@ async fn get_receipts_stream_using_index<'a>(
     let mut stream = log_index
         .query_logs(from_block, to_block, filter.address.iter(), &filter.topics)
         .await?
-        .map_ok(|tx_data| {
-            (
-                tx_data.header_subset.block_number,
-                parse_tx_receipt(
-                    tx_data.header_subset.base_fee_per_gas,
-                    Some(tx_data.header_subset.block_timestamp),
-                    tx_data.header_subset.block_hash,
-                    tx_data.tx,
-                    tx_data.header_subset.gas_used,
-                    tx_data.receipt,
-                    tx_data.header_subset.block_number,
-                    tx_data.header_subset.tx_index,
-                ),
-            )
-        });
+        .map_ok(
+            |TxIndexedData {
+                 tx,
+                 trace: _,
+                 receipt,
+                 header_subset,
+             }| {
+                (
+                    header_subset.block_number,
+                    parse_tx_receipt(
+                        header_subset.block_hash,
+                        header_subset.block_number,
+                        Some(header_subset.block_timestamp),
+                        header_subset.base_fee_per_gas,
+                        header_subset.tx_index,
+                        tx,
+                        receipt,
+                        header_subset.gas_used,
+                    ),
+                )
+            },
+        );
 
     Ok(async_stream::stream! {
         let mut block_number = None;
@@ -1124,12 +1146,29 @@ async fn try_create_logs_stream_using_index<'a>(
     )
 }
 
+fn calculate_block_size(header: &RlpHeader, transactions: &[TxEnvelopeWithSender]) -> usize {
+    let header_len = header.length();
+
+    // sum of each TxEnvelope length wrapped in RLP list
+    let txs_payload_len: usize = transactions.iter().map(|tx| tx.tx.length()).sum();
+    let txs_list_len = alloy_rlp::length_of_length(txs_payload_len) + txs_payload_len;
+
+    // empty Ommers list is 1 byte (0xc0)
+    const OMMERS_LIST_LEN: usize = 1;
+
+    let block_payload_len = header_len + txs_list_len + OMMERS_LIST_LEN;
+
+    alloy_rlp::length_of_length(block_payload_len) + block_payload_len
+}
+
 fn parse_block_content(
     block_hash: FixedBytes<32>,
     header: RlpHeader,
     transactions: Vec<TxEnvelopeWithSender>,
     return_full_txns: bool,
 ) -> Block {
+    let block_size = U256::from(calculate_block_size(&header, &transactions));
+
     // parse transactions
     let transactions = if return_full_txns {
         let txs = transactions
@@ -1161,7 +1200,7 @@ fn parse_block_content(
         header: Header {
             total_difficulty: Some(header.difficulty),
             hash: block_hash,
-            size: Some(U256::from(header.size())),
+            size: Some(block_size),
             inner: header,
         },
         transactions,
@@ -1272,15 +1311,15 @@ async fn get_receipt_from_triedb<T: Triedb>(
                 receipt.receipt.cumulative_gas_used()
             };
 
-            let receipt = crate::handlers::eth::txn::parse_tx_receipt(
-                header.header.base_fee_per_gas,
-                Some(header.header.timestamp),
+            let receipt = parse_tx_receipt(
                 header.hash,
-                tx,
-                gas_used,
-                receipt,
                 block_key.seq_num().0,
+                Some(header.header.timestamp),
+                header.header.base_fee_per_gas,
                 tx_index,
+                tx,
+                receipt,
+                gas_used,
             );
 
             Ok(Some(receipt))
@@ -1291,19 +1330,73 @@ async fn get_receipt_from_triedb<T: Triedb>(
 
 #[cfg(test)]
 mod tests {
+    use alloy_consensus::{Block as ConsensusBlock, BlockBody, Header, TxEnvelope};
     use alloy_eips::BlockNumberOrTag;
+    use alloy_rlp::Encodable;
     use alloy_rpc_types::{Filter, FilterBlockOption};
     use monad_archive::{
         kvstore::WritePolicy,
-        prelude::{ArchiveReader, BlockDataArchive, IndexReaderImpl, TxIndexArchiver},
+        prelude::{
+            ArchiveReader, BlockDataArchive, IndexReaderImpl, TxEnvelopeWithSender, TxIndexArchiver,
+        },
         test_utils::{mock_block, mock_rx, mock_tx, MemoryStorage},
     };
     use monad_triedb_utils::mock_triedb::MockTriedb;
 
     use crate::{
-        chainstate::ChainState,
+        chainstate::{calculate_block_size, ChainState},
         eth_json_types::{BlockTagOrHash, BlockTags, FixedData, Quantity},
     };
+
+    #[test]
+    fn test_calculate_block_size_empty_block() {
+        let header = Header::default();
+        let transactions: Vec<TxEnvelopeWithSender> = vec![];
+
+        let calculated_size = calculate_block_size(&header, &transactions);
+
+        let consensus_block: ConsensusBlock<TxEnvelope> = ConsensusBlock {
+            header,
+            body: BlockBody {
+                transactions: vec![],
+                ommers: vec![],
+                withdrawals: None,
+            },
+        };
+        let expected_size = consensus_block.length();
+
+        assert_eq!(
+            calculated_size, expected_size,
+            "Empty block size mismatch: calculated={}, expected={}",
+            calculated_size, expected_size
+        );
+    }
+
+    #[test]
+    fn test_calculate_block_size_with_transaction() {
+        let header = Header::default();
+
+        let tx_with_sender = mock_tx(12345);
+        let transactions = vec![tx_with_sender.clone()];
+
+        let calculated_size = calculate_block_size(&header, &transactions);
+
+        let consensus_block: ConsensusBlock<TxEnvelope> = ConsensusBlock {
+            header,
+            body: BlockBody {
+                transactions: vec![tx_with_sender.tx],
+                ommers: vec![],
+                withdrawals: None,
+            },
+        };
+        let expected_size = consensus_block.length();
+
+        assert_eq!(
+            calculated_size, expected_size,
+            "Block with tx size mismatch: calculated={}, expected={}",
+            calculated_size, expected_size
+        );
+    }
 
     #[tokio::test]
     async fn test_archive_fallback() {

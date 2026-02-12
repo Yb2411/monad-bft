@@ -625,6 +625,7 @@ where
     CRT: ChainRevision,
 {
     Proposed(BPT::ValidatedBlock),
+    Voted(BPT::ValidatedBlock),
     Finalized(BPT::ValidatedBlock),
 }
 
@@ -636,6 +637,7 @@ where
     EPT: ExecutionProtocol,
 {
     Proposed(ConsensusFullBlock<ST, SCT, EPT>),
+    Voted(ConsensusFullBlock<ST, SCT, EPT>),
     Finalized(ConsensusFullBlock<ST, SCT, EPT>),
 }
 impl<ST, SCT, EPT, BPT, SBT, CCT, CRT>
@@ -653,6 +655,7 @@ where
     fn from(value: &OptimisticPolicyCommit<ST, SCT, EPT, BPT, SBT, CCT, CRT>) -> Self {
         match value {
             OptimisticPolicyCommit::Proposed(block) => Self::Proposed(block.deref().to_owned()),
+            OptimisticPolicyCommit::Voted(block) => Self::Voted(block.deref().to_owned()),
             OptimisticPolicyCommit::Finalized(block) => Self::Finalized(block.deref().to_owned()),
         }
     }

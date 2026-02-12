@@ -184,11 +184,24 @@ impl PartialEq for Response {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Serialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum ResponseWrapper<T> {
     Single(T),
     Batch(Vec<T>),
+}
+
+impl<T> ResponseWrapper<T>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    pub fn from_body_bytes(body: bytes::Bytes) -> serde_json::Result<Self> {
+        if let Ok(batch) = serde_json::from_slice(body.as_ref()) {
+            return Ok(Self::Batch(batch));
+        }
+
+        serde_json::from_slice(body.as_ref()).map(Self::Single)
+    }
 }
 
 impl Response {
@@ -211,6 +224,22 @@ impl Response {
     pub fn from_error(error: JsonRpcError) -> Self {
         Self::new(None, Some(error), RequestId::Null)
     }
+}
+
+pub fn serialize_with_size_limit<T: Serialize>(
+    value: &T,
+    max_size: usize,
+) -> Result<Box<RawValue>, JsonRpcError> {
+    let raw = serde_json::value::to_raw_value(value)
+        .map_err(|e| JsonRpcError::internal_error(format!("serialization error: {}", e)))?;
+
+    if raw.get().as_bytes().len() > max_size {
+        return Err(JsonRpcError::custom(
+            "response exceeds size limit".to_string(),
+        ));
+    }
+
+    Ok(raw)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
@@ -490,7 +519,7 @@ impl From<monad_archive::prelude::Report> for JsonRpcError {
     fn from(e: monad_archive::prelude::Report) -> Self {
         // Log with debug to get more details, but return a generic error for response
         error!("Archive error: {e:?}");
-        Self::internal_error(format!("Archive error: {}", e.to_string()))
+        Self::internal_error(format!("Archive error: {}", e))
     }
 }
 
@@ -639,5 +668,29 @@ mod test {
                 .to_string(),
             "id must be an integer, string, or null"
         );
+    }
+
+    #[test]
+    fn test_serialize_with_size_limit() {
+        use super::serialize_with_size_limit;
+
+        // Small value should succeed with sufficient limit
+        let small_value = serde_json::json!({"key": "value"});
+        let result = serialize_with_size_limit(&small_value, 1000);
+        assert!(result.is_ok());
+
+        // Value should fail when limit is smaller than serialized size
+        let result = serialize_with_size_limit(&small_value, 5);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.message, "response exceeds size limit");
+        assert_eq!(err.code, -32603);
+
+        // Exact boundary: serialized form is `{"key":"value"}` = 15 bytes
+        let result = serialize_with_size_limit(&small_value, 15);
+        assert!(result.is_ok());
+
+        let result = serialize_with_size_limit(&small_value, 14);
+        assert!(result.is_err());
     }
 }

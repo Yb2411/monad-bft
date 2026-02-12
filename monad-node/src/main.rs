@@ -261,7 +261,6 @@ async fn run(node_state: NodeState) -> Result<(), ()> {
                 .get_round(),
             // TODO(andr-dev): Use timestamp from last commit in ledger
             0,
-            true,
         )
         .expect("txpool ipc succeeds"),
         control_panel: ControlPanelIpcReceiver::new(
@@ -601,6 +600,7 @@ where
         ),
     };
     let self_record = MonadNameRecord::new(self_record, &identity);
+    info!(?self_id, ?self_record, "self name record");
     assert!(
         self_record.signature == peer_discovery_config.self_name_record_sig,
         "self name record signature mismatch"
