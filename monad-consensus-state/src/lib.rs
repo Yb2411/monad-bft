@@ -1390,8 +1390,7 @@ where
             // when epoch boundary block is committed, this updates
             // epoch manager records
             self.metrics.consensus_events.commit_block += 1;
-            self.block_policy
-                .update_committed_block(block, &self.config.chain_config);
+            self.block_policy.update_committed_block(block);
             self.epoch_manager
                 .schedule_epoch_start(block.header().seq_num, block.get_block_round());
 
@@ -4139,9 +4138,9 @@ mod test {
             p2.tip.block_header.seq_num,
             p2.tip.block_header.timestamp_ns,
             p2.tip.block_header.round_signature,
-            Some(BASE_FEE),
-            Some(BASE_FEE_TREND),
-            Some(BASE_FEE_MOMENT),
+            BASE_FEE,
+            BASE_FEE_TREND,
+            BASE_FEE_MOMENT,
         );
         let invalid_p2 = ProposalMessage {
             proposal_epoch: invalid_bh2.epoch,
