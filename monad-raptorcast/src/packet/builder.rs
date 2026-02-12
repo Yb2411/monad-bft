@@ -24,9 +24,9 @@ use monad_types::NodeId;
 use rand::Rng;
 
 use super::{
-    assembler::{self, build_header, AssembleMode, BroadcastType, PacketLayout},
+    assembler::{self, build_header, AssembleMode, PacketLayout},
     assigner::{self, ChunkAssignment},
-    BuildError, ChunkAssigner, UdpMessage,
+    BuildError, ChunkAssigner,
 };
 use crate::{
     message::MAX_MESSAGE_SIZE,
@@ -34,7 +34,10 @@ use crate::{
         GroupId, MAX_MERKLE_TREE_DEPTH, MAX_NUM_PACKETS, MAX_REDUNDANCY, MAX_SEGMENT_LENGTH,
         MIN_CHUNK_LENGTH, MIN_MERKLE_TREE_DEPTH,
     },
-    util::{compute_app_message_hash, unix_ts_ms_now, BuildTarget, Redundancy},
+    util::{
+        compute_app_message_hash, unix_ts_ms_now, BroadcastMode, BuildTarget, Collector,
+        Redundancy, UdpMessage,
+    },
 };
 
 pub const DEFAULT_MERKLE_TREE_DEPTH: u8 = 6;
@@ -192,28 +195,6 @@ where
             group_id: None,
         }
     }
-
-    // ----- Delegated build methods -----
-    pub fn build_into<C>(
-        &self,
-        app_message: &[u8],
-        build_target: &BuildTarget<CertificateSignaturePubKey<ST>>,
-        collector: &mut C,
-    ) -> Result<()>
-    where
-        C: super::Collector<UdpMessage<CertificateSignaturePubKey<ST>>>,
-    {
-        self.prepare()
-            .build_into(app_message, build_target, collector)
-    }
-
-    pub fn build_vec(
-        &self,
-        app_message: &[u8],
-        build_target: &BuildTarget<CertificateSignaturePubKey<ST>>,
-    ) -> Result<Vec<UdpMessage<CertificateSignaturePubKey<ST>>>> {
-        self.prepare().build_vec(app_message, build_target)
-    }
 }
 
 pub struct PreparedMessageBuilder<'base, 'key, ST>
@@ -328,7 +309,7 @@ where
         &self,
         merkle_tree_depth: u8,
         layout: PacketLayout,
-        broadcast_type: BroadcastType,
+        broadcast_mode: BroadcastMode,
         app_message_hash: &[u8; 20],
         app_message_len: usize,
     ) -> Result<Bytes> {
@@ -337,7 +318,7 @@ where
 
         let header_buf = build_header(
             0, // version
-            broadcast_type,
+            broadcast_mode,
             merkle_tree_depth,
             group_id,
             unix_ts_ms,
@@ -394,7 +375,7 @@ where
         collector: &mut C,
     ) -> Result<()>
     where
-        C: super::Collector<super::UdpMessage<CertificateSignaturePubKey<ST>>>,
+        C: Collector<UdpMessage<CertificateSignaturePubKey<ST>>>,
     {
         // figure out the layout of the packet
         let segment_size = self.unwrap_segment_size()?;
@@ -424,7 +405,7 @@ where
         let header = self.build_header(
             depth,
             layout,
-            broadcast_type_from_build_target(build_target),
+            broadcast_mode_from_build_target(build_target),
             &app_message_hash,
             app_message.len(),
         )?;
@@ -454,13 +435,13 @@ where
     }
 }
 
-fn broadcast_type_from_build_target<PT>(build_target: &BuildTarget<'_, PT>) -> BroadcastType
+fn broadcast_mode_from_build_target<PT>(build_target: &BuildTarget<'_, PT>) -> BroadcastMode
 where
     PT: PubKey,
 {
     match build_target {
-        BuildTarget::Raptorcast { .. } => BroadcastType::Primary,
-        BuildTarget::FullNodeRaptorCast { .. } => BroadcastType::Secondary,
-        _ => BroadcastType::Unspecified,
+        BuildTarget::Raptorcast { .. } => BroadcastMode::Primary,
+        BuildTarget::FullNodeRaptorCast { .. } => BroadcastMode::Secondary,
+        BuildTarget::Broadcast(_) | BuildTarget::PointToPoint(_) => BroadcastMode::Unspecified,
     }
 }
