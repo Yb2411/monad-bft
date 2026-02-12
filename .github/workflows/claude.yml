@@ -35,3 +35,16 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            Act as three agents: a Security Engineer, a Performance Specialist, and a Senior Rust/Consensus Dev. Review this PR diff and debate the potential issues.
+
+            For each PR, also evaluate:
+            - Failure modes: What can go wrong? What's already handled?
+            - Input domain: What inputs does this code accept?
+            - Output range: What outputs can it produce?
+            - External dependencies: What systems outside this codebase does it rely on?
+            - Decomposition: Can this PR be split into smaller ones?
+            - New symbols: What functions/classes/types does it introduce?
+            - Duplication: Does it duplicate existing code?
+            - Abstractions: Do the design choices make sense?
+            - Context owners: Who has worked on these files before?
