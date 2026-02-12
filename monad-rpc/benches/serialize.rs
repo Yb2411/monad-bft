@@ -13,12 +13,14 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+use std::hint::black_box;
+
 use alloy_primitives::B256;
 use alloy_rpc_types::{Block, BlockTransactions, Log, Transaction, TransactionReceipt};
 use arbitrary::{Arbitrary, Unstructured};
 use criterion::{
-    black_box, criterion_group, criterion_main, measurement::Measurement, BenchmarkGroup,
-    Criterion, Throughput,
+    criterion_group, criterion_main, measurement::Measurement, BenchmarkGroup, Criterion,
+    Throughput,
 };
 use itertools::Itertools;
 use monad_rpc::{
@@ -49,7 +51,7 @@ where
     T: Serialize,
     M: Measurement,
 {
-    g.throughput(Throughput::Bytes(serialize(value).as_bytes().len() as u64));
+    g.throughput(Throughput::Bytes(serialize(value).len() as u64));
     g.bench_function(name, |b| {
         b.iter(|| serialize(black_box(value)));
     });

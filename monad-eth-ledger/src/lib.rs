@@ -156,6 +156,12 @@ where
 
                     self.blocks.insert(block.get_id(), block);
                 }
+                LedgerCommand::LedgerCommit(OptimisticCommit::Voted(block)) => {
+                    let _span = debug_span!("optimistic commit voted").entered();
+                    // Voted blocks are already persisted from Proposed state.
+                    // Just ensure the block is in the cache.
+                    self.blocks.insert(block.get_id(), block);
+                }
                 LedgerCommand::LedgerCommit(OptimisticCommit::Finalized(block)) => {
                     let _span = debug_span!("optimistic commit finalized").entered();
                     self.finalized.insert(block.get_seq_num(), block.clone());
@@ -182,7 +188,7 @@ where
         }
     }
 
-    fn metrics(&self) -> ExecutorMetricsChain {
+    fn metrics(&self) -> ExecutorMetricsChain<'_> {
         Default::default()
     }
 }

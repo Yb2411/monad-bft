@@ -26,6 +26,7 @@ use futures::Stream;
 use monad_block_persist::{BlockPersist, FileBlockPersist};
 use monad_blocksync::messages::message::{
     BlockSyncBodyResponse, BlockSyncHeadersResponse, BlockSyncResponseMessage,
+    BLOCKSYNC_MAX_NUM_HEADERS,
 };
 use monad_consensus_types::{
     block::{BlockRange, ConsensusFullBlock, OptimisticCommit},
@@ -71,8 +72,6 @@ where
 const GAUGE_EXECUTION_LEDGER_NUM_COMMITS: &str = "monad.execution_ledger.num_commits";
 const GAUGE_EXECUTION_LEDGER_NUM_TX_COMMITS: &str = "monad.execution_ledger.num_tx_commits";
 const GAUGE_EXECUTION_LEDGER_BLOCK_NUM: &str = "monad.execution_ledger.block_num";
-
-const BLOCKSYNC_MAX_NUM_HEADERS: u64 = 800;
 
 impl<ST, SCT> MonadBlockFileLedger<ST, SCT>
 where
@@ -175,7 +174,7 @@ where
         &self,
         block_range: BlockRange,
     ) -> BlockSyncHeadersResponse<ST, SCT, EthExecutionProtocol> {
-        if block_range.num_blocks.0 > BLOCKSYNC_MAX_NUM_HEADERS {
+        if block_range.num_blocks.0 > BLOCKSYNC_MAX_NUM_HEADERS as u64 {
             warn!(?block_range, "requested blocksync header range too large");
             return BlockSyncHeadersResponse::NotAvailable(block_range);
         }
@@ -267,6 +266,12 @@ where
                         .update_proposed_head(&block_id)
                         .unwrap();
                 }
+                LedgerCommand::LedgerCommit(OptimisticCommit::Voted(block)) => {
+                    let block_id = block.get_id();
+                    self.update_cache(block);
+
+                    self.bft_block_persist.update_voted_head(&block_id).unwrap();
+                }
                 LedgerCommand::LedgerCommit(OptimisticCommit::Finalized(block)) => {
                     self.metrics[GAUGE_EXECUTION_LEDGER_NUM_COMMITS] += 1;
 
@@ -306,7 +311,7 @@ where
         }
     }
 
-    fn metrics(&self) -> ExecutorMetricsChain {
+    fn metrics(&self) -> ExecutorMetricsChain<'_> {
         self.metrics.as_ref().into()
     }
 }

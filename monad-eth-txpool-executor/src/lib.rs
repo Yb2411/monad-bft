@@ -34,10 +34,11 @@ use monad_crypto::certificate_signature::{
 };
 use monad_eth_block_policy::EthBlockPolicy;
 use monad_eth_txpool::{
-    EthTxPool, EthTxPoolConfig, EthTxPoolEventTracker, PoolTransactionKind, TrackedTxLimitsConfig,
+    EthTxPool, EthTxPoolConfig, EthTxPoolEventTracker, PoolTxKind, TrackedTxLimitsConfig,
 };
-use monad_eth_txpool_ipc::EthTxPoolIpcTx;
-use monad_eth_txpool_types::{EthTxPoolDropReason, EthTxPoolEventType};
+use monad_eth_txpool_types::{
+    EthTxPoolDropReason, EthTxPoolEventType, EthTxPoolIpcTx, EthTxPoolTxInputStream,
+};
 use monad_eth_types::{EthExecutionProtocol, ExtractEthAddress};
 use monad_executor::{Executor, ExecutorMetrics, ExecutorMetricsChain};
 use monad_executor_glue::{MempoolEvent, MonadEvent, TxPoolCommand};
@@ -63,16 +64,17 @@ mod metrics;
 mod preload;
 mod reset;
 
-pub struct EthTxPoolExecutor<ST, SCT, SBT, CCT, CRT>
+pub struct EthTxPoolExecutor<ST, SCT, SBT, CCT, CRT, TIS>
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
     SBT: StateBackend<ST, SCT>,
     CCT: ChainConfig<CRT>,
     CRT: ChainRevision,
+    TIS: EthTxPoolTxInputStream,
 {
     pool: EthTxPool<ST, SCT, SBT, CCT, CRT>,
-    ipc: Pin<Box<EthTxPoolIpcServer>>,
+    tx_input_stream: Pin<Box<TIS>>,
 
     reset: EthTxPoolResetTrigger,
     block_policy: EthBlockPolicy<ST, SCT, CCT, CRT>,
@@ -91,7 +93,7 @@ where
     _phantom: PhantomData<CRT>,
 }
 
-impl<ST, SCT, SBT, CCT, CRT> EthTxPoolExecutor<ST, SCT, SBT, CCT, CRT>
+impl<ST, SCT, SBT, CCT, CRT> EthTxPoolExecutor<ST, SCT, SBT, CCT, CRT, EthTxPoolIpcServer>
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
@@ -110,7 +112,6 @@ where
         chain_config: CCT,
         round: Round,
         execution_timestamp_s: u64,
-        do_local_insert: bool,
     ) -> io::Result<EthTxPoolExecutorClient<ST, SCT, SBT, CCT, CRT>> {
         let ipc = Box::pin(EthTxPoolIpcServer::new(ipc_config)?);
 
@@ -136,7 +137,6 @@ where
                                 soft_tx_expiry,
                                 hard_tx_expiry,
                             ),
-                            do_local_insert,
                         },
                         chain_config.chain_id(),
                         chain_config.get_chain_revision(round),
@@ -145,7 +145,7 @@ where
 
                     Self {
                         pool,
-                        ipc,
+                        tx_input_stream: ipc,
                         block_policy,
                         reset: EthTxPoolResetTrigger::default(),
                         state_backend,
@@ -229,7 +229,7 @@ where
     }
 }
 
-impl<ST, SCT, SBT, CCT, CRT> EthTxPoolExecutor<ST, SCT, SBT, CCT, CRT>
+impl<ST, SCT, SBT, CCT, CRT, TIS> EthTxPoolExecutor<ST, SCT, SBT, CCT, CRT, TIS>
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
@@ -237,6 +237,7 @@ where
     CertificateSignaturePubKey<ST>: ExtractEthAddress,
     CCT: ChainConfig<CRT>,
     CRT: ChainRevision,
+    TIS: EthTxPoolTxInputStream,
 {
     fn process_forwarded_txs(&mut self, forwarded_txs: Vec<ForwardedTxs<SCT>>) {
         for ForwardedTxs { sender, txs } in forwarded_txs {
@@ -277,7 +278,7 @@ where
     }
 }
 
-impl<ST, SCT, SBT, CCT, CRT> Executor for EthTxPoolExecutor<ST, SCT, SBT, CCT, CRT>
+impl<ST, SCT, SBT, CCT, CRT, TIS> Executor for EthTxPoolExecutor<ST, SCT, SBT, CCT, CRT, TIS>
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
@@ -285,6 +286,7 @@ where
     CertificateSignaturePubKey<ST>: ExtractEthAddress,
     CCT: ChainConfig<CRT>,
     CRT: ChainRevision,
+    TIS: EthTxPoolTxInputStream,
 {
     type Command = TxPoolCommand<
         ST,
@@ -449,15 +451,17 @@ where
 
         self.metrics.update(&mut self.executor_metrics);
 
-        self.ipc.as_mut().broadcast_tx_events(ipc_events);
+        self.tx_input_stream
+            .as_mut()
+            .broadcast_tx_events(ipc_events);
     }
 
-    fn metrics(&self) -> ExecutorMetricsChain {
+    fn metrics(&self) -> ExecutorMetricsChain<'_> {
         ExecutorMetricsChain::default().push(&self.executor_metrics)
     }
 }
 
-impl<ST, SCT, SBT, CCT, CRT> Stream for EthTxPoolExecutor<ST, SCT, SBT, CCT, CRT>
+impl<ST, SCT, SBT, CCT, CRT, TIS> Stream for EthTxPoolExecutor<ST, SCT, SBT, CCT, CRT, TIS>
 where
     ST: CertificateSignatureRecoverable,
     SCT: SignatureCollection<NodeIdPubKey = CertificateSignaturePubKey<ST>>,
@@ -465,6 +469,7 @@ where
     CertificateSignaturePubKey<ST>: ExtractEthAddress,
     CCT: ChainConfig<CRT>,
     CRT: ChainRevision,
+    TIS: EthTxPoolTxInputStream,
 
     Self: Unpin,
 {
@@ -481,7 +486,7 @@ where
 
         let Self {
             pool,
-            ipc,
+            tx_input_stream,
 
             reset,
             block_policy,
@@ -510,7 +515,9 @@ where
             return Poll::Pending;
         }
 
-        if let Poll::Ready(unvalidated_txs) = ipc.as_mut().poll_txs(cx, || pool.generate_snapshot())
+        if let Poll::Ready(unvalidated_txs) = tx_input_stream
+            .as_mut()
+            .poll_txs(cx, || pool.generate_snapshot())
         {
             let _span = debug_span!("ipc txs", len = unvalidated_txs.len()).entered();
 
@@ -528,7 +535,7 @@ where
                             match tx.secp256k1_recover() {
                                 Ok(signer) => rayon::iter::Either::Left((
                                     Recovered::new_unchecked(tx, signer),
-                                    PoolTransactionKind::Owned {
+                                    PoolTxKind::Owned {
                                         priority,
                                         extra_data,
                                     },
@@ -572,7 +579,7 @@ where
                 .add_egress_txs(immediately_forwardable_txs.iter());
 
             metrics.update(executor_metrics);
-            ipc.as_mut().broadcast_tx_events(ipc_events);
+            tx_input_stream.as_mut().broadcast_tx_events(ipc_events);
 
             cx.waker().wake_by_ref();
         }
@@ -598,7 +605,7 @@ where
                         match tx.secp256k1_recover() {
                             Ok(signer) => rayon::iter::Either::Left((
                                 Recovered::new_unchecked(tx, signer),
-                                PoolTransactionKind::Forwarded,
+                                PoolTxKind::Forwarded,
                             )),
                             Err(_) => rayon::iter::Either::Right((
                                 *tx.tx_hash(),
@@ -666,7 +673,7 @@ where
         }
 
         metrics.update(executor_metrics);
-        ipc.as_mut().broadcast_tx_events(ipc_events);
+        tx_input_stream.as_mut().broadcast_tx_events(ipc_events);
 
         Poll::Pending
     }

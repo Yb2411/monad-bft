@@ -49,9 +49,9 @@ use tracing::{debug, error, info, warn};
 pub use self::{
     config::EthTxPoolConfig,
     tracked::TrackedTxLimitsConfig,
-    transaction::{max_eip2718_encoded_length, PoolTransactionKind},
+    transaction::{max_eip2718_encoded_length, PoolTxKind},
 };
-use self::{sequencer::ProposalSequencer, tracked::TrackedTxMap, transaction::ValidEthTransaction};
+use self::{sequencer::ProposalSequencer, tracked::TrackedTxMap, transaction::PoolTx};
 use crate::EthTxPoolEventTracker;
 
 mod config;
@@ -75,8 +75,6 @@ where
     chain_id: u64,
     chain_revision: CRT,
     execution_revision: MonadExecutionRevision,
-
-    do_local_insert: bool,
 }
 
 impl<ST, SCT, SBT, CCT, CRT> EthTxPool<ST, SCT, SBT, CCT, CRT>
@@ -96,7 +94,6 @@ where
     ) -> Self {
         let EthTxPoolConfig {
             limits: config_limits,
-            do_local_insert,
         } = config;
 
         Self {
@@ -107,8 +104,6 @@ where
             chain_id,
             chain_revision,
             execution_revision,
-
-            do_local_insert,
         }
     }
 
@@ -130,17 +125,9 @@ where
         block_policy: &EthBlockPolicy<ST, SCT, CCT, CRT>,
         state_backend: &SBT,
         chain_config: &CCT,
-        txs: Vec<(Recovered<TxEnvelope>, PoolTransactionKind)>,
-        mut on_insert: impl FnMut(&ValidEthTransaction),
+        txs: Vec<(Recovered<TxEnvelope>, PoolTxKind)>,
+        mut on_insert: impl FnMut(&PoolTx),
     ) {
-        if !self.do_local_insert {
-            event_tracker.drop_all(
-                txs.into_iter().map(|(tx, _)| tx),
-                EthTxPoolDropReason::PoolNotReady,
-            );
-            return;
-        }
-
         let Some(last_commit) = self.last_commit.as_ref() else {
             event_tracker.drop_all(
                 txs.into_iter().map(|(tx, _)| tx),
@@ -154,7 +141,7 @@ where
 
         let (txs, invalid_txs): (Vec<_>, Vec<_>) =
             txs.into_par_iter().partition_map(|(tx, kind)| {
-                Either::from(ValidEthTransaction::validate(
+                Either::from(PoolTx::validate(
                     last_commit,
                     self.chain_id,
                     chain_params,
@@ -175,7 +162,7 @@ where
         // the range at N-k+1.
         let block_seq_num = block_policy.get_last_commit() + SeqNum(1);
 
-        let account_balance_addresses = txs.iter().map(ValidEthTransaction::signer).collect_vec();
+        let account_balance_addresses = txs.iter().map(PoolTx::signer).collect_vec();
 
         let account_balances = match block_policy.compute_account_base_balances(
             block_seq_num,
@@ -191,7 +178,7 @@ where
                     "failed to insert transactions at account_balance lookups"
                 );
                 event_tracker.drop_all(
-                    txs.into_iter().map(ValidEthTransaction::into_raw),
+                    txs.into_iter().map(PoolTx::into_raw),
                     EthTxPoolDropReason::Internal(EthTxPoolInternalDropReason::StateBackendError),
                 );
                 return;
@@ -233,9 +220,7 @@ where
                     "failed to insert transactions at account_nonce lookups"
                 );
                 event_tracker.drop_all(
-                    txs.into_values()
-                        .flatten()
-                        .map(ValidEthTransaction::into_raw),
+                    txs.into_values().flatten().map(PoolTx::into_raw),
                     EthTxPoolDropReason::Internal(EthTxPoolInternalDropReason::StateBackendError),
                 );
                 return;
@@ -245,7 +230,7 @@ where
         for (address, txs) in txs {
             let Some(account_nonce) = account_nonces.remove(&address) else {
                 event_tracker.drop_all(
-                    txs.into_iter().map(ValidEthTransaction::into_raw),
+                    txs.into_iter().map(PoolTx::into_raw),
                     EthTxPoolDropReason::Internal(EthTxPoolInternalDropReason::StateBackendError),
                 );
                 continue;
@@ -535,18 +520,14 @@ where
 
     pub fn generate_snapshot(&self) -> EthTxPoolSnapshot {
         EthTxPoolSnapshot {
-            txs: self
-                .tracked
-                .iter_txs()
-                .map(ValidEthTransaction::hash)
-                .collect(),
+            txs: self.tracked.iter_txs().map(PoolTx::hash).collect(),
         }
     }
 
     pub fn generate_sender_snapshot(&self) -> Vec<Address> {
         self.tracked
             .iter_txs()
-            .map(ValidEthTransaction::signer)
+            .map(PoolTx::signer)
             .unique()
             .collect()
     }
@@ -738,7 +719,6 @@ where
                     Duration::from_secs(60),
                     Duration::from_secs(60),
                 ),
-                do_local_insert: true,
             },
             MockChainConfig::DEFAULT.chain_id(),
             MockChainRevision::DEFAULT,
