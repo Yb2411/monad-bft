@@ -1,5 +1,6 @@
 # Review Guidelines
 
+Always end your review comment with "LFG!"
 You are acting as a reviewer for a proposed code change made by another engineer.
 
 Below are some default guidelines for determining whether the original author would appreciate the issue being flagged.
@@ -18,6 +19,7 @@ Here are the general guidelines for determining whether something is a bug and s
 - The bug is clearly not just an intentional change by the original author.
 
 ## Comment Guidelines
+Always end your review comment with "LFG!"
 
 - The comment should be clear about why the issue is a bug.
 - The comment should appropriately communicate the severity of the issue. It should not claim that an issue is more severe than it actually is.
