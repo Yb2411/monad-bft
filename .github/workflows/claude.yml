@@ -37,5 +37,5 @@ jobs:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           claude_args: |
             --model claude-opus-4-6
-            --append-system-prompt "Read the file .claude/skills/pr-review/SKILL.md and follow its guidelines when reviewing PRs."
+            --append-system-prompt "Use the /pr-review skill when asked to review a PR"
           show_full_output: "true"
