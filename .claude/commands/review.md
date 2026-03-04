@@ -1,5 +1,4 @@
 ---
-allowed-tools: Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh api:*)
 description: Review a pull request for bugs using priority levels
 ---
 
