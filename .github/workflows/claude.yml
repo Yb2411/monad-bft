@@ -35,5 +35,7 @@ jobs:
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          claude_args: "--model claude-opus-4-6"
+          claude_args: |
+            --model claude-opus-4-6
+            --append-system-prompt "Read the file PR-REVIEW.md at the repo root and follow its guidelines when reviewing PRs."
           show_full_output: "true"
