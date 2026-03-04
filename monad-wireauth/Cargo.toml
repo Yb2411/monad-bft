@@ -20,10 +20,6 @@ aegis.workspace = true
 zeroize = { workspace = true, features = ["derive"] }
 
 [dev-dependencies]
-clap = { workspace = true, features = ["derive"] }
-monoio = { workspace = true, features = ["sync", "macros"] }
-tracing-subscriber = { workspace = true, features = ["env-filter"] }
-rstest.workspace = true
 proptest.workspace = true
 criterion.workspace = true
 insta = { workspace = true, features = ["yaml"] }
