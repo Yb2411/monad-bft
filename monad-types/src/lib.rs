@@ -140,6 +140,13 @@ pub struct RoundSpan {
 }
 
 impl RoundSpan {
+    // TODO: The empty RoundSpan is only used in the Group struct
+    // representing a validator set. Remove this exception after we
+    // refactor out the Group struct.
+    pub fn empty(at: Round) -> Self {
+        Self { start: at, end: at }
+    }
+
     pub fn new(start: Round, end: Round) -> Option<Self> {
         if start >= end {
             return None;
@@ -165,12 +172,9 @@ impl RoundSpan {
     }
 }
 
-impl Default for RoundSpan {
-    fn default() -> Self {
-        Self {
-            start: Round::MIN,
-            end: Round::MIN,
-        }
+impl From<RoundSpan> for std::ops::Range<Round> {
+    fn from(span: RoundSpan) -> Self {
+        span.start..span.end
     }
 }
 
